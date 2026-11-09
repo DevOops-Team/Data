@@ -34,6 +34,16 @@ S3 · DynamoDB 주소는 boto3 표준 `AWS_ENDPOINT_URL`로 바꾼다(로컬만)
 
 사이드카 추가 환경 변수: `RANK_WAIT_SECONDS`(300) · `KEEP_LOCAL`(2) · `HEARTBEAT_SECONDS`(10) · `POLL_SECONDS`(2) · `IMAGE_DIGEST`
 
+### 승인 사건 발행 (Kafka)
+
+rank 0 사이드카가 승인(OK · ALREADY)하면 `job.lifecycle` 토픽에 `checkpoint.approved`를 보낸다 → 수집기가 `data.checkpoints`에 저장.
+
+- 환경 변수: `KAFKA_BOOTSTRAP`(없으면 발행 안 함) · `KAFKA_TOPIC_LIFECYCLE`(job.lifecycle) · `NODE_NAME`(Downward API `spec.nodeName`)
+- `event_id` = `ckpt-{job}-g{세대 4자리}-s{step 8자리}` → 같은 step을 다시 보내도 DB에는 한 번만
+- 메시지 키 = `job_id` (같은 job 사건은 같은 파티션 → 순서 유지)
+- payload: `step` `format` `world_size` `manifest_key` `file_count` `size_bytes` `config_sha256`(필수, 수집기 기준) + `image_digest` `upload_ms`(rank 0 업로드) `saved_at`(.done 시각) `approved_at`
+- 최선 노력: Kafka 장애 · 전달 실패는 로그(`events.delivery_failed` 등)만 남기고 체크포인트 저장 · 승인은 그대로. 프로듀서는 `acks=all` · 멱등 · 10분까지 재시도
+
 ## trainer와의 약속
 
 - 저장: `CKPT_DIR/step-XXXXXXXX/`에 다 쓴 뒤 마지막에 `step-XXXXXXXX.done`
@@ -61,7 +71,7 @@ cd checkpoint && ../.venv/bin/python examples/dcp_flow.py     # moto, AWS 불필
 ## 남은 것
 
 - 노찬경 train.py에 약속 3가지 적용 확인 (예시: `examples/tiny_trainer.py`)
-- 승인 사건 Kafka `job.lifecycle` 발행
+- 실제 Kafka(3대)로 발행 → 수집기 저장까지 확인
 - 저장 · 업로드 시간 측정 → 저장 주기 결정
 - 학습 데이터 manifest 형식 (백엔드와 합의)
 - 컨테이너 이미지 · JobSet 템플릿 연결

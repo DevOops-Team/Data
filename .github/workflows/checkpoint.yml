@@ -40,6 +40,6 @@ jobs:
           tags: devoops/ckpt:ci
       - name: 진입점 확인 (init · sidecar 모듈 로드, 비루트 실행)
         run: |
-          docker run --rm devoops/ckpt:ci python -c "import ckpt.init_main, ckpt.sidecar, ckpt.retry; print('ok')"
+          docker run --rm devoops/ckpt:ci python -c "import ckpt.init_main, ckpt.sidecar, ckpt.retry, ckpt.events, confluent_kafka; print('ok')"
           docker run --rm devoops/ckpt:ci id -u | grep -qx 1000
           docker run --rm -e JOB_ID=x devoops/ckpt:ci python -m ckpt.init_main 2>&1 | grep -q "GENERATION"

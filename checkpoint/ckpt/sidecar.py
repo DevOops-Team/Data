@@ -5,6 +5,7 @@
    - DynamoDB 세대 · owner 확인 → 다르면 STOP
    - 내 rank 파일 업로드 + ranks/rank-NNNN.json
    - rank 0: rank 목록이 WORLD_SIZE개 모이면 manifest 작성 → 조건부 승인
+   - 승인되면 Kafka job.lifecycle에 checkpoint.approved 발행 (최선 노력, events.py)
 2. 승인된 step은 로컬에 .approved 생성 (rank 0 외에는 DynamoDB를 보고 확인)
 3. 오래된 로컬 step 정리 (최근 KEEP_LOCAL개 + 현재 승인본은 유지)
 4. rank 0: 하트비트 (HEARTBEAT_SECONDS 간격)
@@ -12,14 +13,16 @@
 from __future__ import annotations
 
 import os
+import signal
 import shutil
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-from . import layout
+from . import events, layout
 from .config import Config
-from .fencing import ApproveResult, FencingTable
+from .fencing import ApproveResult, FencingTable, now_iso
 from .log import log
 from .retry import is_transient
 from .storage import Store
@@ -30,8 +33,12 @@ STOP_EXIT_CODE = 75  # trainer가 STOP을 보고 쓰는 종료 코드 (노찬경
 class Sidecar:
     def __init__(self, cfg: Config, fencing: FencingTable, store: Store, *,
                  rank_wait_seconds: float | None = None, keep_local: int | None = None,
-                 heartbeat_seconds: float | None = None, image_digest: str | None = None):
+                 heartbeat_seconds: float | None = None, image_digest: str | None = None,
+                 publisher: events.Publisher | None = None):
         self.cfg, self.fencing, self.store = cfg, fencing, store
+        self.publisher = publisher or events.NullPublisher()
+        self.lifecycle_topic = os.environ.get("KAFKA_TOPIC_LIFECYCLE", "job.lifecycle")
+        self._upload_ms: dict[int, int] = {}
         self.rank_wait = rank_wait_seconds if rank_wait_seconds is not None else float(os.environ.get("RANK_WAIT_SECONDS", "300"))
         self.keep_local = keep_local if keep_local is not None else int(os.environ.get("KEEP_LOCAL", "2"))
         self.hb_every = heartbeat_seconds if heartbeat_seconds is not None else float(os.environ.get("HEARTBEAT_SECONDS", "10"))
@@ -86,8 +93,9 @@ class Sidecar:
                 log("sidecar.upload_failed", step=step, rank=cfg.rank, error=repr(e))
                 return
             self._uploaded_marker(step).touch()
+            self._upload_ms[step] = int((time.monotonic() - t0) * 1000)
             log("sidecar.uploaded", step=step, rank=cfg.rank, files=len(entries),
-                bytes=sum(e.size_bytes for e in entries), upload_ms=int((time.monotonic() - t0) * 1000))
+                bytes=sum(e.size_bytes for e in entries), upload_ms=self._upload_ms[step])
 
         if layout.approved_marker(cfg.ckpt_dir, step).exists():
             return
@@ -107,8 +115,9 @@ class Sidecar:
             return
         self._waiting_since.pop(step, None)
         try:
-            self.store.build_and_put_manifest(cfg.job_id, cfg.generation, step, cfg.world_size,
-                                              cfg.checkpoint_format, cfg.config_sha256, self.image_digest, lists)
+            manifest = self.store.build_and_put_manifest(cfg.job_id, cfg.generation, step, cfg.world_size,
+                                                         cfg.checkpoint_format, cfg.config_sha256, self.image_digest,
+                                                         lists)
         except ValueError as e:
             log("sidecar.verify_failed", step=step, error=str(e))  # 승인 안 함, 이전 승인본 유지
             return
@@ -116,10 +125,37 @@ class Sidecar:
         log("sidecar.approve", step=step, result=res.value)
         if res in (ApproveResult.OK, ApproveResult.ALREADY):
             layout.approved_marker(cfg.ckpt_dir, step).touch()
-            # TODO: Kafka job.lifecycle에 checkpoint.approved 발행 (수집기와 함께)
+            self._publish_approved(step, manifest)
         elif res in (ApproveResult.FENCED, ApproveResult.NO_ITEM):
             self.stop("approve_" + res.value, step=step)
         # STALE: 늦은 요청이라 건너뜀. RECOVERING: 다음 tick에 다시 시도
+
+    def _publish_approved(self, step: int, manifest: dict) -> None:
+        """checkpoint.approved → 수집기가 data.checkpoints에 저장. 실패해도 승인 흐름에는 영향 없음."""
+        cfg = self.cfg
+        try:
+            approved_at = now_iso()
+            done = layout.done_marker(cfg.ckpt_dir, step)
+            saved_at = (datetime.fromtimestamp(done.stat().st_mtime, timezone.utc)
+                        .isoformat(timespec="milliseconds").replace("+00:00", "Z")) if done.exists() else approved_at
+            files = manifest["files"]
+            payload = {
+                "step": step, "format": manifest["format"], "world_size": manifest["world_size"],
+                "manifest_key": layout.s3_manifest_key(cfg.job_id, cfg.generation, step),
+                "file_count": len(files), "size_bytes": sum(int(f["size_bytes"]) for f in files),
+                "config_sha256": manifest.get("config_sha256") or "unknown",
+                "image_digest": manifest.get("image_digest"),
+                "upload_ms": self._upload_ms.get(step),     # rank 0 업로드 시간 (재시작 뒤면 없음)
+                "saved_at": saved_at,                         # .done 파일 시각 = trainer 저장 완료
+                "approved_at": approved_at,
+            }
+            ev = events.envelope(type_="checkpoint.approved",
+                                 event_id=events.checkpoint_approved_id(cfg.job_id, cfg.generation, step),
+                                 cluster=cfg.cluster, job_id=cfg.job_id, generation=cfg.generation,
+                                 payload=payload, occurred_at=approved_at)
+            self.publisher.publish(topic=self.lifecycle_topic, key=cfg.job_id, value=ev)
+        except Exception as e:  # noqa: BLE001
+            log("sidecar.publish_failed", step=step, error=repr(e))
 
     def _mark_if_approved(self, step: int) -> None:
         item = self.fencing.get(self.cfg.job_id)
@@ -175,11 +211,19 @@ class Sidecar:
 
 def main() -> None:
     cfg = Config.from_env()
-    sc = Sidecar(cfg, FencingTable(cfg.table, region=cfg.region), Store(cfg.bucket, region=cfg.region))
+    publisher = events.from_env() if cfg.rank == 0 else events.NullPublisher()   # 발행은 rank 0만
+    sc = Sidecar(cfg, FencingTable(cfg.table, region=cfg.region), Store(cfg.bucket, region=cfg.region),
+                 publisher=publisher)
     poll = float(os.environ.get("POLL_SECONDS", "2"))
     log("sidecar.start", job_id=cfg.job_id, gen=cfg.generation, rank=cfg.rank, world_size=cfg.world_size)
     once = "--once" in sys.argv
-    while True:
+    stopping = False
+
+    def _term(*_):
+        nonlocal stopping
+        stopping = True
+    signal.signal(signal.SIGTERM, _term)
+    while not stopping:
         try:
             sc.tick()
         except Exception as e:  # noqa: BLE001 — 예상 못 한 오류도 사이드카를 죽이지 않음 (학습은 계속, 이 step만 미승인)
@@ -187,6 +231,7 @@ def main() -> None:
         if once or sc.stopped:
             break
         time.sleep(poll)
+    publisher.flush(5.0)   # 보내지 못한 사건이 있으면 최대 5초 기다림
     # STOP 후에도 Pod가 끝날 때까지 남아 있으면 되지만, 여기서는 그대로 종료한다.
 
 
