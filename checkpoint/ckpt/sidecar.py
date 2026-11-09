@@ -21,6 +21,7 @@ from . import layout
 from .config import Config
 from .fencing import ApproveResult, FencingTable
 from .log import log
+from .retry import is_transient
 from .storage import Store
 
 STOP_EXIT_CODE = 75  # trainer가 STOP을 보고 쓰는 종료 코드 (노찬경 합의)
@@ -75,7 +76,15 @@ class Sidecar:
                 return
             step_dir = layout.local_step_dir(cfg.ckpt_dir, step)
             t0 = time.monotonic()
-            entries = self.store.upload_rank(cfg.job_id, cfg.generation, step, cfg.rank, step_dir)
+            try:
+                entries = self.store.upload_rank(cfg.job_id, cfg.generation, step, cfg.rank, step_dir)
+            except Exception as e:  # noqa: BLE001
+                if not is_transient(e):
+                    raise
+                # 파일 단위 재시도(3회)까지 실패 → 이 step은 승인하지 않음. 이전 승인본 유지, 다음 저장 때 다시
+                self._uploaded_marker(step).with_suffix(".abandoned").touch()
+                log("sidecar.upload_failed", step=step, rank=cfg.rank, error=repr(e))
+                return
             self._uploaded_marker(step).touch()
             log("sidecar.uploaded", step=step, rank=cfg.rank, files=len(entries),
                 bytes=sum(e.size_bytes for e in entries), upload_ms=int((time.monotonic() - t0) * 1000))
@@ -144,17 +153,24 @@ class Sidecar:
 
     # ---------- 한 사이클 ----------
     def tick(self) -> None:
+        """DynamoDB · S3 연결 오류는 STOP이 아니다. 이번 사이클만 건너뛰고 다음 사이클에 다시 한다.
+        STOP은 조건부 갱신이 '거부'됐을 때(세대 · owner 불일치)만."""
         if self.stopped:
             return
-        self.heartbeat()
-        for step in self.done_steps():
-            if self.stopped:
-                return
-            if self._uploaded_marker(step).with_suffix(".abandoned").exists():
-                continue
-            self.process_step(step)
-        if not self.stopped:
-            self.cleanup()
+        try:
+            self.heartbeat()
+            for step in self.done_steps():
+                if self.stopped:
+                    return
+                if self._uploaded_marker(step).with_suffix(".abandoned").exists():
+                    continue
+                self.process_step(step)
+            if not self.stopped:
+                self.cleanup()
+        except Exception as e:  # noqa: BLE001
+            if not is_transient(e):
+                raise
+            log("sidecar.transient_skip", error=repr(e))
 
 
 def main() -> None:
@@ -164,7 +180,10 @@ def main() -> None:
     log("sidecar.start", job_id=cfg.job_id, gen=cfg.generation, rank=cfg.rank, world_size=cfg.world_size)
     once = "--once" in sys.argv
     while True:
-        sc.tick()
+        try:
+            sc.tick()
+        except Exception as e:  # noqa: BLE001 — 예상 못 한 오류도 사이드카를 죽이지 않음 (학습은 계속, 이 step만 미승인)
+            log("sidecar.error", error=repr(e))
         if once or sc.stopped:
             break
         time.sleep(poll)

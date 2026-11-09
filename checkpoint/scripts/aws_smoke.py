@@ -27,7 +27,7 @@ import boto3  # noqa: E402
 from ckpt import layout  # noqa: E402
 from ckpt.config import Config  # noqa: E402
 from ckpt.fencing import ApproveResult, FencingTable, create_table  # noqa: E402
-from ckpt.init_main import EXIT_DOWNLOAD, EXIT_GEN, EXIT_OK, EXIT_OWNER  # noqa: E402
+from ckpt.init_main import EXIT_CORRUPT, EXIT_GEN, EXIT_OK, EXIT_OWNER  # noqa: E402
 from ckpt.init_main import run as init_run  # noqa: E402
 from ckpt.sidecar import Sidecar  # noqa: E402
 from ckpt.storage import Store  # noqa: E402
@@ -145,7 +145,7 @@ def run(bucket: str, table: str, region: str, mb: int, keep: bool) -> int:
         fencing.start_recovery(job, 2, rid2)
         fencing.advance_generation(job, 2, rid2)
         g3 = make_cfg(job, bucket, table, region, tmp / "g3", gen=3, rank=0, cluster="local-d")
-        check("⑧ 손상 → init 시작 안 함", init_run(g3, fencing, store) == EXIT_DOWNLOAD)
+        check("⑧ 손상 → init 시작 안 함 (종료 코드 7)", init_run(g3, fencing, store) == EXIT_CORRUPT)
 
         job2 = job + "-x"
         fencing.create_job(job2)

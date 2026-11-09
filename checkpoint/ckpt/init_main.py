@@ -8,11 +8,16 @@
 5. trainer가 읽을 재개 정보 기록: CKPT_DIR/resume.json, step 폴더, .done · .approved 표시
 
 종료 코드
-0 정상 · 2 세대 불일치 · 3 owner 선점 실패 · 4 다운로드 · 체크섬 실패 · 5 승인본이 현재 작업과 맞지 않음 · 6 항목 없음
+0 정상 · 2 세대 불일치 · 3 owner 선점 실패 · 4 연결 오류로 다운로드 실패(재시도 · 제한 시간 초과, 다시 띄우면 될 수 있음)
+5 승인본이 현재 작업과 맞지 않음 · 6 항목 없음 · 7 승인본 손상(체크섬 · 크기 불일치, 파일 없음 — 같은 승인본으로는 안 됨)
+
+재시도: 일시 오류는 3회(5 → 10 → 20초), 다운로드 전체 제한 DOWNLOAD_DEADLINE_S(기본 600초).
+복구 컨트롤러의 '복원 · 학습 진행 확인 30분' 안에 끝나도록 한다.
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -21,9 +26,10 @@ from . import layout
 from .config import Config
 from .fencing import FencingTable
 from .log import log
+from .retry import CorruptError, RetryPolicy, is_transient
 from .storage import Store, sha256_file
 
-EXIT_OK, EXIT_GEN, EXIT_OWNER, EXIT_DOWNLOAD, EXIT_MISMATCH, EXIT_NO_ITEM = 0, 2, 3, 4, 5, 6
+EXIT_OK, EXIT_GEN, EXIT_OWNER, EXIT_DOWNLOAD, EXIT_MISMATCH, EXIT_NO_ITEM, EXIT_CORRUPT = 0, 2, 3, 4, 5, 6, 7
 
 
 def _s3_key(uri: str) -> tuple[str, str]:
@@ -31,8 +37,14 @@ def _s3_key(uri: str) -> tuple[str, str]:
     return u.netloc, u.path.lstrip("/")
 
 
-def run(cfg: Config, fencing: FencingTable, store: Store) -> int:
-    item = fencing.get(cfg.job_id)
+def run(cfg: Config, fencing: FencingTable, store: Store, policy: RetryPolicy | None = None) -> int:
+    policy = policy or RetryPolicy(deadline_s=float(os.environ.get("DOWNLOAD_DEADLINE_S", "600")))
+    policy.started()
+    try:
+        item = policy.call(lambda: fencing.get(cfg.job_id))
+    except Exception as e:  # noqa: BLE001
+        log("init.ddb_unreachable", error=repr(e))
+        return EXIT_DOWNLOAD
     if item is None:
         log("init.no_item", job_id=cfg.job_id)
         return EXIT_NO_ITEM
@@ -42,8 +54,13 @@ def run(cfg: Config, fencing: FencingTable, store: Store) -> int:
         log("init.generation_mismatch", env_gen=cfg.generation, ddb_gen=item.generation)
         return EXIT_GEN
 
-    # 2. owner 선점
-    if not fencing.claim_owner(cfg.job_id, cfg.generation, cfg.cluster):
+    # 2. owner 선점 (조건 실패는 재시도하지 않음, 연결 오류만 재시도)
+    try:
+        claimed = policy.call(lambda: fencing.claim_owner(cfg.job_id, cfg.generation, cfg.cluster))
+    except Exception as e:  # noqa: BLE001
+        log("init.ddb_unreachable", error=repr(e))
+        return EXIT_DOWNLOAD
+    if not claimed:
         log("init.owner_claim_failed", cluster=cfg.cluster, owner=(fencing.get(cfg.job_id) or item).owner)
         return EXIT_OWNER
     log("init.owner_claimed", cluster=cfg.cluster, gen=cfg.generation)
@@ -57,9 +74,9 @@ def run(cfg: Config, fencing: FencingTable, store: Store) -> int:
             if bucket != store.bucket:
                 raise ValueError(f"CONFIG_URI 버킷이 CKPT_BUCKET과 다름: {bucket}")
             if cfg.config_sha256:
-                store.download_verified(key, dest, cfg.config_sha256)
+                store.download_with_retry(key, dest, cfg.config_sha256, None, policy)
             else:
-                store.s3.download_file(bucket, key, str(dest))
+                policy.call(lambda: store.s3.download_file(bucket, key, str(dest)))
             log("init.config_ready", path=str(dest))
 
         # 3-2. 학습 데이터 (manifest 형식은 체크포인트와 같다고 가정 — 백엔드와 합의 필요)
@@ -68,11 +85,11 @@ def run(cfg: Config, fencing: FencingTable, store: Store) -> int:
             prefix = prefix if prefix.endswith("/") else prefix + "/"
             mpath = cfg.data_dir / "manifest.json"
             mpath.parent.mkdir(parents=True, exist_ok=True)
-            store.s3.download_file(bucket, prefix + "manifest.json", str(mpath))
+            policy.call(lambda: store.s3.download_file(bucket, prefix + "manifest.json", str(mpath)))
             if cfg.dataset_manifest_sha256 and sha256_file(mpath) != cfg.dataset_manifest_sha256:
-                raise ValueError("학습 데이터 manifest 체크섬 불일치")
+                raise CorruptError("학습 데이터 manifest 체크섬 불일치")
             for f in json.loads(mpath.read_text())["files"]:
-                store.download_verified(prefix + f["name"], cfg.data_dir / f["name"], f["sha256"], f["size_bytes"])
+                store.download_with_retry(prefix + f["name"], cfg.data_dir / f["name"], f["sha256"], f["size_bytes"], policy)
             log("init.dataset_ready", path=str(cfg.data_dir))
 
         # 4. 승인본
@@ -85,9 +102,12 @@ def run(cfg: Config, fencing: FencingTable, store: Store) -> int:
 
         gen, step = item.approved_gen, item.approved_step
         step_dir = layout.local_step_dir(cfg.ckpt_dir, step)
-        manifest = store.download_checkpoint(cfg.job_id, gen, step, step_dir)
-    except Exception as e:  # noqa: BLE001 — 어떤 실패든 시작하지 않고 보고
-        log("init.download_failed", error=str(e))
+        manifest = store.download_checkpoint(cfg.job_id, gen, step, step_dir, policy)
+    except CorruptError as e:
+        log("init.corrupt", error=str(e))          # 같은 승인본으로는 안 됨 → 복구 컨트롤러가 prev_approved 등 판단
+        return EXIT_CORRUPT
+    except Exception as e:  # noqa: BLE001 — 그 밖의 실패도 시작하지 않고 보고
+        log("init.download_failed", error=repr(e), transient=is_transient(e))
         return EXIT_DOWNLOAD
 
     # 승인본이 지금 작업과 맞는지 (규약 7절 3번)

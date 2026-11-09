@@ -11,6 +11,8 @@ import boto3
 
 from . import layout
 from .fencing import now_iso
+from .log import log
+from .retry import CorruptError, RetryPolicy, is_not_found
 
 CHUNK = 8 * 1024 * 1024
 
@@ -39,9 +41,10 @@ def list_step_files(step_dir: Path) -> list[FileEntry]:
 
 
 class Store:
-    def __init__(self, bucket: str, client=None, region: str = "us-east-2"):
+    def __init__(self, bucket: str, client=None, region: str = "us-east-2", retry: RetryPolicy | None = None):
         self.bucket = bucket
         self.s3 = client or boto3.client("s3", region_name=region)
+        self.retry = retry or RetryPolicy()
 
     # ---------- 공통 ----------
     def put_json(self, key: str, obj) -> None:
@@ -71,23 +74,41 @@ class Store:
     def download_verified(self, key: str, dest: Path, sha256: str, size: int | None = None) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".part")
-        self.s3.download_file(self.bucket, key, str(tmp))
+        try:
+            self.s3.download_file(self.bucket, key, str(tmp))
+        except Exception as e:  # noqa: BLE001
+            if is_not_found(e):
+                raise CorruptError(f"파일 없음: {key}") from e
+            raise
         if size is not None and tmp.stat().st_size != size:
             tmp.unlink()
-            raise ValueError(f"크기 불일치: {key}")
+            raise CorruptError(f"크기 불일치: {key}")
         if sha256_file(tmp) != sha256:
             tmp.unlink()
-            raise ValueError(f"체크섬 불일치: {key}")
+            raise CorruptError(f"체크섬 불일치: {key}")
         tmp.replace(dest)
+
+    def download_with_retry(self, key: str, dest: Path, sha256: str, size: int | None, policy: RetryPolicy) -> None:
+        """일시 오류는 policy대로 재시도. 손상은 1번 더 받아 보고 또 틀리면 CorruptError."""
+        for attempt in (1, 2):
+            try:
+                policy.call(lambda: self.download_verified(key, dest, sha256, size),
+                            on_retry=lambda n, e: log("storage.download_retry", key=key, attempt=n, error=repr(e)))
+                return
+            except CorruptError as e:
+                if attempt == 2:
+                    raise
+                log("storage.download_redo_corrupt", key=key, error=str(e))
 
     # ---------- 사이드카: 내 rank 파일 업로드 ----------
     def upload_rank(self, job_id: str, gen: int, step: int, rank: int, step_dir: Path) -> list[FileEntry]:
         prefix = layout.s3_step_prefix(job_id, gen, step)
         entries = list_step_files(step_dir)
-        for e in entries:
-            self.s3.upload_file(str(step_dir / e.name), self.bucket, prefix + e.name)  # 큰 파일은 자동 멀티파트
-        self.put_json(layout.s3_rank_list_key(job_id, gen, step, rank),
-                      {"rank": rank, "files": [asdict(e) for e in entries], "uploaded_at": now_iso()})
+        for e in entries:   # 큰 파일은 자동 멀티파트. 일시 오류는 파일 단위로 재시도
+            self.retry.call(lambda e=e: self.s3.upload_file(str(step_dir / e.name), self.bucket, prefix + e.name),
+                            on_retry=lambda n, err, e=e: log("storage.upload_retry", file=e.name, attempt=n, error=repr(err)))
+        body = {"rank": rank, "files": [asdict(e) for e in entries], "uploaded_at": now_iso()}
+        self.retry.call(lambda: self.put_json(layout.s3_rank_list_key(job_id, gen, step, rank), body))
         return entries
 
     def rank_lists(self, job_id: str, gen: int, step: int, world_size: int) -> list[dict] | None:
@@ -127,9 +148,17 @@ class Store:
         return manifest
 
     # ---------- ckpt-init: 승인본 다운로드 ----------
-    def download_checkpoint(self, job_id: str, gen: int, step: int, dest_dir: Path) -> dict:
-        manifest = self.get_json(layout.s3_manifest_key(job_id, gen, step))
+    def download_checkpoint(self, job_id: str, gen: int, step: int, dest_dir: Path,
+                            policy: RetryPolicy | None = None) -> dict:
+        policy = policy or self.retry
+        mkey = layout.s3_manifest_key(job_id, gen, step)
+        try:
+            manifest = policy.call(lambda: self.get_json(mkey))
+        except Exception as e:  # noqa: BLE001
+            if is_not_found(e):
+                raise CorruptError(f"승인본 manifest 없음: {mkey}") from e
+            raise
         prefix = layout.s3_step_prefix(job_id, gen, step)
         for f in manifest["files"]:
-            self.download_verified(prefix + f["name"], dest_dir / f["name"], f["sha256"], f["size_bytes"])
+            self.download_with_retry(prefix + f["name"], dest_dir / f["name"], f["sha256"], f["size_bytes"], policy)
         return manifest

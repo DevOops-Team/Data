@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ckpt import layout
 from ckpt.config import Config
-from ckpt.init_main import EXIT_DOWNLOAD, EXIT_GEN, EXIT_OK, EXIT_OWNER
+from ckpt.init_main import EXIT_CORRUPT, EXIT_GEN, EXIT_OK, EXIT_OWNER
 from ckpt.init_main import run as init_run
 from ckpt.sidecar import Sidecar
 
@@ -116,12 +116,12 @@ def test_corrupted_checkpoint_blocks_start(names, fencing, store, tmp_path):
     Sidecar(c, fencing, store, heartbeat_seconds=0).tick()
     assert fencing.get(JOB).approved_step == 100
 
-    # S3의 조각 하나를 망가뜨림 → 재개 init이 체크섬 불일치로 시작 안 함
+    # S3의 조각 하나를 망가뜨림 → 재개 init이 손상(7)으로 시작 안 함
     store.s3.put_object(Bucket=store.bucket, Key=layout.s3_step_prefix(JOB, 1, 100) + "__0_0.distcp", Body=b"broken")
     fencing.start_recovery(JOB, 1, "r1")
     fencing.advance_generation(JOB, 1, "r1")
     c2 = Config(**{**c.__dict__, "generation": 2, "ckpt_dir": tmp_path / "p2" / "ckpt"})
-    assert init_run(c2, fencing, store) == EXIT_DOWNLOAD
+    assert init_run(c2, fencing, store) == EXIT_CORRUPT
 
 
 def test_missing_rank_is_not_approved(names, fencing, store, tmp_path):

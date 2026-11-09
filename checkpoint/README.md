@@ -14,11 +14,23 @@
 ## 실행
 
 ```bash
-python -m ckpt.init_main          # 종료 코드 0 정상 · 2 세대 불일치 · 3 owner 선점 실패 · 4 다운로드/체크섬 실패 · 5 승인본 불일치 · 6 항목 없음
+python -m ckpt.init_main          # 종료 코드는 아래 표
 python -m ckpt.sidecar            # 계속 실행 (--once: 한 사이클만)
 ```
 
+| ckpt-init 종료 코드 | 뜻 | 복구 쪽 판단 |
+|---|---|---|
+| 0 | 정상 | — |
+| 2 | 세대 불일치 | 옛 세대. 띄우면 안 됨 |
+| 3 | owner 선점 실패 | 같은 세대가 다른 클러스터에서 실행 중 |
+| 4 | 연결 오류로 실패 (재시도 · 제한 시간 초과) | 다시 띄우면 될 수 있음 |
+| 5 | 승인본이 지금 작업과 다름 (config · world_size) | 설정 문제 |
+| 6 | DynamoDB 항목 없음 | 제출 과정 문제 |
+| 7 | 승인본 손상 (체크섬 · 크기 불일치, 파일 없음) | 같은 승인본으로는 안 됨 → prev_approved 등 판단 |
+
 S3 · DynamoDB 주소는 boto3 표준 `AWS_ENDPOINT_URL`로 바꾼다(로컬만). EKS에선 비워 둔다.
+
+재시도 (규약 10절 · 한송이 「장애 복구 규약」 4절과 맞춤): `RETRY_ATTEMPTS`(3) · `RETRY_BACKOFF`(5,10,20초) · `DOWNLOAD_DEADLINE_S`(600, ckpt-init 전체). 연결 오류만 재시도, 손상 · 조건 거부는 재시도 안 함. 사이드카는 연결 오류로 STOP하거나 죽지 않고 다음 사이클에 다시 함. 업로드가 재시도까지 실패하면 그 step만 미승인.
 
 사이드카 추가 환경 변수: `RANK_WAIT_SECONDS`(300) · `KEEP_LOCAL`(2) · `HEARTBEAT_SECONDS`(10) · `POLL_SECONDS`(2) · `IMAGE_DIGEST`
 

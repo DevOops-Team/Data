@@ -39,6 +39,7 @@ def aws_env(monkeypatch, endpoint):
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
     monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
     monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)
+    monkeypatch.setenv("RETRY_BACKOFF", "0")   # 테스트에서는 재시도 대기 없음
 
 
 @pytest.fixture
