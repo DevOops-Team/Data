@@ -1,0 +1,7 @@
+-r requirements.txt
+# 테스트 · 로컬 (이미지에는 안 들어감)
+moto[server]>=5.0
+pytest>=8
+# examples/ 실제 DCP 흐름 확인용
+torch>=2.6
+numpy

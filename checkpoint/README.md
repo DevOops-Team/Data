@@ -43,14 +43,14 @@ S3 · DynamoDB 주소는 boto3 표준 `AWS_ENDPOINT_URL`로 바꾼다(로컬만)
 ## 테스트 (AWS 없이, moto 서버)
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -r checkpoint/requirements.txt
+python -m venv .venv && .venv/bin/pip install -r checkpoint/requirements-dev.txt
 cd checkpoint && ../.venv/bin/python -m pytest -q
 ```
 
 ## 실제 DCP 흐름 확인 (`examples/`)
 
 ```bash
-.venv/bin/pip install "torch>=2.6" numpy
+.venv/bin/pip install -r checkpoint/requirements-dev.txt
 cd checkpoint && ../.venv/bin/python examples/dcp_flow.py     # moto, AWS 불필요
 ```
 
