@@ -45,6 +45,7 @@ class Sidecar:
 
     def stop(self, reason: str, **fields) -> None:
         if not self.stopped:
+            self.cfg.ckpt_dir.mkdir(parents=True, exist_ok=True)
             layout.stop_file(self.cfg.ckpt_dir).write_text(reason + "\n")
             log("sidecar.stop", reason=reason, **fields)
         self.stopped = True

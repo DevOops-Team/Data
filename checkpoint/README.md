@@ -35,9 +35,20 @@ python -m venv .venv && .venv/bin/pip install -r checkpoint/requirements.txt
 cd checkpoint && ../.venv/bin/python -m pytest -q
 ```
 
+## 실제 DCP 흐름 확인 (`examples/`)
+
+```bash
+.venv/bin/pip install "torch>=2.6" numpy
+cd checkpoint && ../.venv/bin/python examples/dcp_flow.py     # moto, AWS 불필요
+```
+
+- `tiny_trainer.py`: FSDP2(CPU · gloo) 작은 trainer. 위 약속 3가지를 지키는 예시
+- `dcp_flow.py`: A 끊김 없는 학습 체크섬 == B step 25 강제 종료 → 승인본 20에서 재개한 학습 체크섬, C 학습 도중 세대 +1 → STOP → 종료
+- **torchrun은 worker의 종료 코드 75를 1로 바꿔 돌려준다.** 컨테이너가 75로 끝나야 하면, torchrun이 끝난 뒤 `$CKPT_DIR/STOP`이 있으면 `exit 75` 하도록 진입 스크립트에서 처리 **[노찬경과 합의 필요]**
+
 ## 남은 것
 
-- 실제 DCP(`dcp.save` / `dcp.load`) trainer와 연결 확인 (노찬경 train.py)
+- 노찬경 train.py에 약속 3가지 적용 확인 (예시: `examples/tiny_trainer.py`)
 - 승인 사건 Kafka `job.lifecycle` 발행
 - 저장 · 업로드 시간 측정 → 저장 주기 결정
 - 학습 데이터 manifest 형식 (백엔드와 합의)
