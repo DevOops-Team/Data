@@ -45,21 +45,33 @@ def pg_dsn():
     with psycopg.connect(admin, autocommit=True) as c:
         c.execute("CREATE ROLE data_app LOGIN")
         c.execute("CREATE DATABASE gpuf_data OWNER data_app")
-    dsn = f"host=127.0.0.1 port={port} user=data_app dbname=gpuf_data"
-    with psycopg.connect(dsn, autocommit=True) as c:
+    base = f"host=127.0.0.1 port={port} dbname=gpuf_data"
+    with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:
         c.execute("CREATE SCHEMA data")
         c.execute((ROOT / "db" / "001_init.sql").read_text())   # 실제 적용한 스키마 그대로
-    yield dsn
+    with psycopg.connect(f"{base} user=postgres", autocommit=True) as c:
+        c.execute((ROOT / "db" / "002_roles.sql").read_text())
+        c.execute((ROOT / "db" / "002_roles.sql").read_text())  # 두 번 실행해도 안전한지
+    yield {"owner": f"{base} user=data_app", "collector": f"{base} user=data_collector",
+           "exporter": f"{base} user=postgres_exporter"}
     subprocess.run([PG_BIN / "pg_ctl", "-D", data, "-m", "immediate", "stop"], capture_output=True)
     shutil.rmtree(tmp, ignore_errors=True)
 
 
 @pytest.fixture
 def conn(pg_dsn):
-    with psycopg.connect(pg_dsn, autocommit=True) as c:
-        c.execute("TRUNCATE data.events, data.event_rejects, data.results, data.checkpoints, data.job_runs, "
-                  "data.experiments CASCADE")
-    c = psycopg.connect(pg_dsn)
+    """결과 확인용 소유자(data_app) 연결. 테이블을 비우고 시작한다."""
+    c = psycopg.connect(pg_dsn["owner"], autocommit=True)
+    c.execute("TRUNCATE data.events, data.event_rejects, data.results, data.checkpoints, data.job_runs, "
+              "data.experiments CASCADE")
+    yield c
+    c.close()
+
+
+@pytest.fixture
+def collector_conn(pg_dsn):
+    """수집기가 쓰는 연결: data_collector 계정 (002_roles.sql 권한만). 권한이 빠지면 테스트가 실패한다."""
+    c = psycopg.connect(pg_dsn["collector"])
     yield c
     c.close()
 

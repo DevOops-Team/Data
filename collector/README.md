@@ -33,7 +33,16 @@ Kafka 토픽의 사건을 읽어 PostgreSQL `gpuf_data`의 `data` 스키마(`db/
 | `KAFKA_BOOTSTRAP` | (필수) 브로커 목록 `host:port,...` |
 | `KAFKA_GROUP` | `data-collector` |
 | `KAFKA_TOPICS` | `gpu.fault,recovery.action,job.lifecycle,fault.injection,monitoring.log` |
-| `PGHOST` `PGPORT` `PGDATABASE` `PGUSER` `PGPASSWORD` `PGSSLMODE` | libpq 표준 (비밀번호는 Secret으로 주입) |
+| `PGHOST` `PGPORT` `PGDATABASE` `PGUSER` `PGPASSWORD` `PGSSLMODE` | libpq 표준. `PGUSER=data_collector` (비밀번호는 Secret으로 주입) |
+
+### DB 계정 (`db/002_roles.sql`)
+
+| 계정 | 권한 | 용도 |
+|---|---|---|
+| `data_collector` | `events` 읽기·추가, `event_rejects` 추가, `experiments`·`job_runs` 읽기·추가·수정, `checkpoints` 읽기·추가. 삭제·DDL·`results` 없음. `statement_timeout` 30s | 수집기 |
+| `postgres_exporter` | `pg_monitor` (통계 읽기만), 데이터 테이블 접근 없음, 연결 3개까지 | 모니터링 (ADR-18) |
+
+슈퍼유저로 실행한 뒤 `\password data_collector`, `\password postgres_exporter`로 비밀번호를 지정하고, `pg_hba.conf`에 필요한 주소만 허용한다.
 | `BATCH_SIZE` · `POLL_TIMEOUT_S` · `RETRY_SLEEP_S` | `500` · `1.0` · `5` |
 
 ## 실행
