@@ -15,6 +15,8 @@ Kafka 토픽의 사건을 읽어 PostgreSQL `gpuf_data`의 `data` 스키마(`db/
 - 메시지마다 savepoint: 한 메시지가 DB 오류(값 범위 등)를 내면 그것만 `event_rejects`로 보내고 나머지는 계속 저장한다.
 - DB 연결 오류: 커밋하지 않고 읽은 위치를 되감은 뒤 `RETRY_SLEEP_S` 기다렸다가 같은 묶음을 다시 처리한다.
 - 파생에 필요한 필드가 없으면 파생만 건너뛴다 (원본은 `events`에 남음, 로그 `collector.derive_skipped`).
+- 복구로 생긴 세대(`job.submitted` 없이 `job.resumed`만 옴)는 같은 작업의 이전 세대에서 `exp_id` · `gpus` · `strategy` · `config_sha256` · `image_digest`를 이어받는다. `queue` · `cluster`는 복구 때 바뀌므로 이어받지 않는다.
+- 실험 사건이 작업보다 늦게 와도 그 작업의 모든 세대에 `exp_id`를 붙인다.
 
 ### 파생에 필요한 payload 필드
 
@@ -62,4 +64,14 @@ python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 PG_BIN=/opt/homebrew/opt/postgresql@16/bin .venv/bin/python -m pytest -q
 ```
 
-확인 항목: 중복 무시 · 형식 오류 보관 · experiments/job_runs/checkpoints 파생 · 실험보다 먼저 온 job 연결 · 불량 메시지 격리 · DB 끊김 시 되감기·미커밋 · `v_incidents` 계산.
+확인 항목: 중복 무시 · 형식 오류 보관 · experiments/job_runs/checkpoints 파생 · 실험보다 먼저 온 job 연결 · 세대 이어받기 · 불량 메시지 격리 · DB 끊김 시 되감기·미커밋 · `v_incidents` 계산.
+
+### 실제 경로 시험 (Kafka → 수집기 → DB)
+
+`scripts/e2e_events.py`가 작업 1개의 흐름(실험 시작 → 제출 → 시작 → 체크포인트 승인 → 장애 주입 → 펜싱 → 세대 2 재개 → 실험 종료)과 중복 1건 · 형식 오류 1건을 `키|JSON` 줄로 만든다. 표준 라이브러리만 써서 Kafka VM에서 바로 실행된다. `--prefix`를 시험마다 바꾸면 사건 ID가 겹치지 않는다. `gpu.fault` · `recovery.action`은 복구 컨트롤러가 읽을 수 있어 쓰지 않는다.
+
+```bash
+B=172.30.0.40:9092,172.30.0.41:9092,172.30.0.42:9092
+python3 e2e_events.py --prefix t1 --topic job.lifecycle | /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server $B --topic job.lifecycle --producer-property acks=all --property parse.key=true --property key.separator='|'
+```
