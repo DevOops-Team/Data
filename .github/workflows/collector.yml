@@ -1,13 +1,14 @@
 name: collector
 
+# main 필수 검사로 쓰므로 경로 필터 없이 모든 PR에서 실행 (경로 필터가 있으면 해당 경로를 건드리지 않는 PR이 검사 대기로 막힘)
 on:
-  push:
-    paths: ["collector/**", "db/**", ".github/workflows/collector.yml"]
   pull_request:
-    paths: ["collector/**", "db/**", ".github/workflows/collector.yml"]
+  push:
+    branches: [develop, main]
 
 jobs:
   test:
+    name: collector · test
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -28,6 +29,7 @@ jobs:
           PG_BIN: /usr/lib/postgresql/16/bin
 
   image:
+    name: collector · image
     runs-on: ubuntu-24.04
     needs: test
     steps:
