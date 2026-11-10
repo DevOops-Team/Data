@@ -78,6 +78,10 @@ class Sidecar:
     # ---------- 1. 업로드 · 승인 ----------
     def process_step(self, step: int) -> None:
         cfg = self.cfg
+        # 이미 승인된 step은 올리지 않음. init이 재개용으로 받은 승인본(.done · .approved)을
+        # 새 세대 경로로 다시 올리지 않게 함 (11/10 실제 AWS 1단계에서 rank당 134MB 재업로드 확인)
+        if layout.approved_marker(cfg.ckpt_dir, step).exists():
+            return
         if not self._uploaded_marker(step).exists():
             if self._fenced():  # 업로드 전 펜싱 (규약 9절)
                 return

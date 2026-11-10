@@ -105,6 +105,9 @@ def test_save_approve_fail_resume(names, fencing, store, tmp_path):
     item = fencing.get(JOB)
     assert (item.approved_gen, item.approved_step) == (2, 150)
     assert store.exists("jobs/3f9a1c2e/gen-0002/step-00000150/manifest.json")
+    # 재개용으로 받은 승인본(step 100)은 새 세대로 다시 올리지 않음
+    assert not any(store.exists(layout.s3_rank_list_key(JOB, 2, 100, r)) for r in range(WORLD))
+    assert not store.exists(layout.s3_step_prefix(JOB, 2, 100) + "__0_0.distcp")
 
 
 def test_corrupted_checkpoint_blocks_start(names, fencing, store, tmp_path):
