@@ -211,7 +211,7 @@ class Sidecar:
 
 def main() -> None:
     cfg = Config.from_env()
-    publisher = events.from_env() if cfg.rank == 0 else events.NullPublisher()   # 발행은 rank 0만
+    publisher = events.from_env(cfg.bucket, cfg.region) if cfg.rank == 0 else events.NullPublisher()   # 발행은 rank 0만
     sc = Sidecar(cfg, FencingTable(cfg.table, region=cfg.region), Store(cfg.bucket, region=cfg.region),
                  publisher=publisher)
     poll = float(os.environ.get("POLL_SECONDS", "2"))
