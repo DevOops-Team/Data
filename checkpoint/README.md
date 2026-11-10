@@ -42,7 +42,24 @@ rank 0 사이드카가 승인(OK · ALREADY)하면 `job.lifecycle` 토픽에 `ch
 - `event_id` = `ckpt-{job}-g{세대 4자리}-s{step 8자리}` → 같은 step을 다시 보내도 DB에는 한 번만
 - 메시지 키 = `job_id` (같은 job 사건은 같은 파티션 → 순서 유지)
 - payload: `step` `format` `world_size` `manifest_key` `file_count` `size_bytes` `config_sha256`(필수, 수집기 기준) + `image_digest` `upload_ms`(rank 0 업로드) `saved_at`(.done 시각) `approved_at`
-- 최선 노력: Kafka 장애 · 전달 실패는 로그(`events.delivery_failed` 등)만 남기고 체크포인트 저장 · 승인은 그대로. 프로듀서는 `acks=all` · 멱등 · 10분까지 재시도
+- 최선 노력: Kafka 장애 · 전달 실패가 있어도 체크포인트 저장 · 승인은 그대로. 프로듀서는 `acks=all` · 멱등 · **30분**까지 재시도(`KAFKA_MESSAGE_TIMEOUT_MS`, 장애 복구 규약의 재개 대기 30분과 맞춤)
+
+### S3 대기열 (outbox) — VPN이 끊겨도 사건을 잃지 않게
+
+EKS → 온프레 Kafka는 사이트 간 VPN을 지난다. 오래 끊기거나 그 사이 Pod가 교체되면 프로듀서 메모리에만 있던 사건이 사라진다. 그래서 Kafka로 못 보낸 사건은 S3에 보관했다가 다시 보낸다 (Confluence 「VPN 끊김 시 Kafka 사건 유실 문제」 제안 C).
+
+| 언제 대기열로 가나 | 어떻게 |
+|---|---|
+| 전달 최종 실패 (30분 재시도 초과) | 실패 콜백에서 저장 |
+| 보내기 즉시 오류 (버퍼 가득 등) | 예외 처리에서 저장 |
+| 종료(SIGTERM) 때 못 보낸 사건 | `flush` 5초 안에 못 보내면 `purge` → 실패 콜백 → 저장 |
+
+- 위치: `s3://{CKPT_BUCKET}/events-outbox/ckpt-sidecar/{event_id}.json` (`OUTBOX_PREFIX`, 빈 값이면 대기열 끔). 내용 = 토픽 · 키 · 사건 JSON · 저장 시각 · 이유
+- 같은 사건은 같은 키라 여러 번 저장돼도 1개. 수집기가 `event_id`로 중복을 버려서 다시 보내도 안전
+- 대기열 저장이 실패해도 예외 없이 로그(`outbox.store_failed`)만 남김
+- **다시 보내기** (온프레에서 실행): `python -m ckpt.outbox` — `REPLAY_INTERVAL_S`(60)마다 대기열을 읽어 Kafka로 보내고 전달 확인(acks=all)된 것만 지움. `--once`는 한 번만. 깨진 객체는 건너뛰고 남겨 둠(사람이 확인)
+- 필요 권한 (박기현): 학습 Pod 역할 `s3:PutObject` on `events-outbox/*` · 다시 보내기(온프레 인증 경로) `s3:ListBucket`(prefix `events-outbox/`) · `GetObject` · `DeleteObject`
+- 남는 한계: 강제 종료(SIGKILL) · 노드 전원 차단 순간 메모리에만 있던 사건은 여전히 잃을 수 있음
 
 ## trainer와의 약속
 
