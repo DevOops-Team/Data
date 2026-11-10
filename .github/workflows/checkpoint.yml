@@ -1,16 +1,17 @@
 name: checkpoint
 
+# main 필수 검사로 쓰므로 경로 필터 없이 모든 PR에서 실행 (경로 필터가 있으면 해당 경로를 건드리지 않는 PR이 검사 대기로 막힘)
 on:
-  push:
-    paths: ["checkpoint/**", ".github/workflows/checkpoint.yml"]
   pull_request:
-    paths: ["checkpoint/**", ".github/workflows/checkpoint.yml"]
+  push:
+    branches: [develop, main]
 
 permissions:
   contents: read
 
 jobs:
   test:
+    name: checkpoint · test
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -26,6 +27,7 @@ jobs:
         run: RETRY_BACKOFF=0 python scripts/aws_smoke.py --moto --mb 2
 
   image:
+    name: checkpoint · image
     runs-on: ubuntu-latest
     needs: test
     steps:
