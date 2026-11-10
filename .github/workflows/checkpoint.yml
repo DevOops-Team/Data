@@ -1,0 +1,45 @@
+name: checkpoint
+
+on:
+  push:
+    paths: ["checkpoint/**", ".github/workflows/checkpoint.yml"]
+  pull_request:
+    paths: ["checkpoint/**", ".github/workflows/checkpoint.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: checkpoint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt "moto[server]>=5.0" "pytest>=8"
+      - run: python -m pytest -q
+      - name: 실제 AWS 스모크 스크립트를 moto로 검증
+        run: RETRY_BACKOFF=0 python scripts/aws_smoke.py --moto --mb 2
+
+  image:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: 이미지 빌드 (push는 이미지 저장소 GHCR/ECR 확정 후)
+        uses: docker/build-push-action@v6
+        with:
+          context: checkpoint
+          load: true
+          push: false
+          tags: devoops/ckpt:ci
+      - name: 진입점 확인 (init · sidecar 모듈 로드, 비루트 실행)
+        run: |
+          docker run --rm devoops/ckpt:ci python -c "import ckpt.init_main, ckpt.sidecar, ckpt.retry, ckpt.events, confluent_kafka; print('ok')"
+          docker run --rm devoops/ckpt:ci id -u | grep -qx 1000
+          docker run --rm -e JOB_ID=x devoops/ckpt:ci python -m ckpt.init_main 2>&1 | grep -q "GENERATION"

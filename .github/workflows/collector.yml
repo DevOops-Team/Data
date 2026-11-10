@@ -1,0 +1,40 @@
+name: collector
+
+on:
+  push:
+    paths: ["collector/**", "db/**", ".github/workflows/collector.yml"]
+  pull_request:
+    paths: ["collector/**", "db/**", ".github/workflows/collector.yml"]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: collector
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: PostgreSQL 16 바이너리 확인
+        run: |
+          if [ ! -x /usr/lib/postgresql/16/bin/initdb ]; then
+            sudo apt-get update && sudo apt-get install -y postgresql-16
+          fi
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+
+  image:
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: 이미지 빌드 (push 안 함)
+        run: docker build -t devoops/collector:ci collector
+      - name: 이미지 점검
+        run: |
+          docker run --rm devoops/collector:ci python -c "import collector.main, confluent_kafka, psycopg; print('ok')"
+          test "$(docker run --rm devoops/collector:ci id -u)" = "1000"
