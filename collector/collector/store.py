@@ -85,12 +85,13 @@ def _experiment_started(cur: Cursor, e: Event) -> None:
          bool(p["spare_enabled"]), p.get("checkpoint_every_steps"), Jsonb(p.get("conditions") or {}),
          e.occurred_at, p.get("note")),
     )
-    # 실험보다 먼저 도착한 job.submitted가 있으면 exp_id 연결 (토픽이 달라 순서 보장 없음)
+    # 실험보다 먼저 도착한 job.submitted가 있으면 exp_id 연결 (토픽이 달라 순서 보장 없음).
+    # 실험은 작업 전체에 걸리므로 그 작업의 모든 세대(복구로 생긴 세대 포함)에 연결한다.
     cur.execute(
         """UPDATE data.job_runs jr SET exp_id = %s
            FROM data.events ev
            WHERE ev.type = 'job.submitted' AND ev.payload->>'exp_id' = %s
-             AND jr.job_id = ev.job_id AND jr.generation = ev.generation AND jr.exp_id IS NULL""",
+             AND jr.job_id = ev.job_id AND jr.exp_id IS NULL""",
         (p["exp_id"], p["exp_id"]),
     )
 
@@ -133,13 +134,23 @@ def _job_run(cur: Cursor, e: Event) -> None:
     submitted = t == "job.submitted"
     started = t in ("job.started", "job.resumed")
     end_reason = END_REASONS.get(t)
+    # 새 세대 줄은 같은 작업의 바로 이전 세대에서 exp_id · gpus · strategy · config · image를 이어받는다.
+    # 복구 재제출은 JobSet 템플릿 6절의 값(이름 · 큐 · 세대 · 클러스터 등)만 바뀌고 나머지는 같기 때문.
+    # queue · cluster는 복구 때 바뀌므로 이어받지 않는다.
     cur.execute(
         """INSERT INTO data.job_runs (job_id, generation, exp_id, jobset_name, cluster, queue, gpus, strategy,
                                       config_sha256, image_digest, submitted_at, started_at, ended_at, end_reason)
-           VALUES (%(job_id)s, %(gen)s, (SELECT exp_id FROM data.experiments WHERE exp_id = %(exp_id)s),
-                   COALESCE(%(jobset)s, %(jobset_default)s), %(cluster)s, %(queue)s,
-                   COALESCE(%(gpus)s, 0), COALESCE(%(strategy)s, 'unknown'), %(cfg)s, %(img)s,
-                   %(submitted_at)s, %(started_at)s, %(ended_at)s, %(end_reason)s)
+           SELECT %(job_id)s, %(gen)s,
+                  COALESCE((SELECT exp_id FROM data.experiments WHERE exp_id = %(exp_id)s), prev.exp_id),
+                  COALESCE(%(jobset)s, %(jobset_default)s), %(cluster)s, %(queue)s,
+                  COALESCE(%(gpus)s, prev.gpus, 0), COALESCE(%(strategy)s, prev.strategy, 'unknown'),
+                  COALESCE(%(cfg)s, prev.config_sha256), COALESCE(%(img)s, prev.image_digest),
+                  %(submitted_at)s, %(started_at)s, %(ended_at)s, %(end_reason)s
+           FROM (SELECT 1) AS one
+           LEFT JOIN LATERAL (
+             SELECT exp_id, gpus, strategy, config_sha256, image_digest FROM data.job_runs
+             WHERE job_id = %(job_id)s AND generation < %(gen)s
+             ORDER BY generation DESC LIMIT 1) AS prev ON true
            ON CONFLICT (job_id, generation) DO UPDATE SET
              exp_id        = COALESCE(data.job_runs.exp_id, EXCLUDED.exp_id),
              jobset_name   = COALESCE(%(jobset)s, data.job_runs.jobset_name),

@@ -134,3 +134,35 @@ def test_v_incidents_from_collected_events(conn, collector_conn):
     ])
     r = one(conn, "SELECT detect_s, classify_s, recover_s, signal_lag_s FROM data.v_incidents")
     assert [float(x) for x in r] == [5.0, 20.0, 180.0, 2.0]
+
+
+def test_new_generation_inherits_from_previous(conn, collector_conn):
+    """복구로 생긴 세대(job.submitted 없이 job.resumed만 옴)는 이전 세대 값을 이어받는다. queue · cluster는 제외."""
+    env1 = {"job_id": "j-inh", "generation": 1, "cluster": "eks-a"}
+    run(collector_conn, [
+        msg("experiment.started", payload={"exp_id": "exp-inh", "scenario": "s", "policy": "ours",
+                                           "spare_enabled": True}),
+        msg("job.submitted", payload={"jobset_name": "job-j-inh-g0001", "gpus": 4, "strategy": "fsdp",
+                                      "queue": "queue-heavy", "exp_id": "exp-inh", "config_sha256": "cfg1"}, **env1),
+        msg("job.fenced", **env1),
+        msg("job.resumed", job_id="j-inh", generation=2, cluster="eks-b"),
+    ])
+    r = one(conn, "SELECT exp_id, jobset_name, gpus, strategy, config_sha256, queue, cluster "
+                  "FROM data.job_runs WHERE job_id='j-inh' AND generation=2")
+    assert r == ("exp-inh", "job-j-inh-g0002", 4, "fsdp", "cfg1", None, "eks-b")
+
+
+def test_late_experiment_links_all_generations(conn, collector_conn):
+    """실험 사건이 늦게 와도 그 작업의 모든 세대에 exp_id가 붙는다."""
+    run(collector_conn, [
+        msg("job.submitted", payload={"gpus": 2, "strategy": "fsdp", "exp_id": "exp-late"},
+            job_id="j-late", generation=1),
+        msg("job.fenced", job_id="j-late", generation=1),
+        msg("job.resumed", job_id="j-late", generation=2),
+    ], [
+        msg("experiment.started", payload={"exp_id": "exp-late", "scenario": "s", "policy": "ours",
+                                           "spare_enabled": False}),
+    ])
+    rows = conn.execute("SELECT generation, exp_id, gpus FROM data.job_runs WHERE job_id='j-late' "
+                        "ORDER BY generation").fetchall()
+    assert rows == [(1, "exp-late", 2), (2, "exp-late", 2)]
