@@ -1,0 +1,236 @@
+# Data 이미지 CI (ADR-26 GHCR · ADR-23 봇 배포). 폴더 하나 = 이미지 하나 (K8s ci.yml과 같은 구조).
+#
+#   이미지                               폴더(Dockerfile)   쓰임
+#   ghcr.io/devoops-team/checkpoint      checkpoint/        학습 Pod의 ckpt-init(command: python -m ckpt.init_main) · ckpt-sidecar(기본 CMD) 공용
+#   ghcr.io/devoops-team/collector       collector/         Kafka 수집기, 온프레미스 data-system (ADR-13 · ADR-29)
+#
+#   PR · develop push : 두 이미지 모두 테스트 + 이미지 빌드 · 점검 (push 안 함)
+#   main push(머지)   : 같은 검사 → 바뀐 폴더의 이미지만 push {main, sha-<7자리>}
+#                       → Variable DEPLOY_IMAGES(쉼표 목록, 공백 없이)에 든 이미지만 봇이 Gitops overlay digest 갱신
+#
+# main 필수 검사: "checkpoint · test" · "checkpoint · image" · "collector · test" · "collector · image" (matrix job 이름).
+#   경로 필터를 걸면 해당 경로를 건드리지 않는 PR이 검사 대기로 막히므로 모든 PR에서 전부 돈다.
+# 안 바뀐 이미지를 다시 push하면 digest가 달라져 불필요한 재배포가 생기므로 main에서도 바뀐 것만 push한다.
+# 새 이미지 추가: matrix.include 두 곳(test · image)과 changes job의 판정에 한 줄씩.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # main push에서 push · 배포할 이미지 고르기 (자기 폴더 · 이 파일 기준)
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    outputs:
+      images: ${{ steps.diff.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          all="checkpoint collector"
+          if [ "$EVENT" != push ] || [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ] \
+             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            images="$all"
+          else
+            files=$(git diff --name-only "$BEFORE" "$GITHUB_SHA")
+            printf '바뀐 파일:\n%s\n' "$files"
+            has() { grep -qE "$1" <<<"$files"; }
+            images=""
+            if has '^\.github/workflows/ci\.yml$'; then images="$all"; else
+              has '^checkpoint/' && images+=" checkpoint"
+              has '^collector/'  && images+=" collector"
+            fi
+          fi
+          images=$(echo $images)
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "### 대상 이미지: ${images:-(없음)}" >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: ${{ matrix.name }} · test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: checkpoint
+            install: pip install -r requirements.txt "moto[server]>=5.0" "pytest>=8"
+            test: |
+              python -m pytest -q
+              # 실제 AWS 스모크 스크립트를 moto로 검증
+              RETRY_BACKOFF=0 python scripts/aws_smoke.py --moto --mb 2
+          - name: collector
+            install: pip install -r requirements-dev.txt
+            test: python -m pytest -q
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"          # Dockerfile 베이스와 같게
+      - name: PostgreSQL 16 바이너리 확인
+        if: matrix.name == 'collector'
+        run: |
+          if [ ! -x /usr/lib/postgresql/16/bin/initdb ]; then
+            sudo apt-get update && sudo apt-get install -y postgresql-16
+          fi
+      - name: pip install
+        working-directory: ${{ matrix.name }}
+        run: ${{ matrix.install }}
+      - name: test
+        working-directory: ${{ matrix.name }}
+        env:
+          PG_BIN: /usr/lib/postgresql/16/bin
+        run: ${{ matrix.test }}
+
+  image:
+    name: ${{ matrix.name }} · image
+    needs: [changes, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write                     # GHCR push (GITHUB_TOKEN)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: checkpoint
+            check: |
+              # 진입점 확인 (init · sidecar 모듈 로드, 비루트 실행)
+              docker run --rm "$LOCAL" python -c "import ckpt.init_main, ckpt.sidecar, ckpt.retry, ckpt.events, confluent_kafka; print('ok')"
+              docker run --rm "$LOCAL" id -u | grep -qx 1000
+              docker run --rm -e JOB_ID=x "$LOCAL" python -m ckpt.init_main 2>&1 | grep -q "GENERATION"
+          - name: collector
+            check: |
+              docker run --rm "$LOCAL" python -c "import collector.main, confluent_kafka, psycopg; print('ok')"
+              test "$(docker run --rm "$LOCAL" id -u)" = "1000"
+    env:
+      IMAGE: ghcr.io/devoops-team/${{ matrix.name }}
+      LOCAL: devoops/${{ matrix.name }}:ci
+      PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(format(' {0} ', needs.changes.outputs.images), format(' {0} ', matrix.name)) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: 이미지 빌드
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.name }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.LOCAL }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      - name: 이미지 점검
+        run: ${{ matrix.check }}
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        if: env.PUSH == 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=main
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=${{ matrix.name }}
+      - id: push
+        name: GHCR push (위와 같은 빌드, 캐시 재사용)
+        if: env.PUSH == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.name }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+
+      # matrix job 출력은 마지막 한 개만 남으므로 이미지별 digest는 artifact로 넘긴다.
+      - name: Record digest
+        if: env.PUSH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p digests
+          printf '{"name":"%s","image":"%s","digest":"%s"}\n' "${{ matrix.name }}" "$IMAGE" "$DIGEST" > "digests/${{ matrix.name }}.json"
+          echo "### ${{ matrix.name }}: \`${IMAGE}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+      - if: env.PUSH == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.name }}
+          path: digests/${{ matrix.name }}.json
+          retention-days: 1
+
+  # push한 이미지 중 DEPLOY_IMAGES에 든 것만 배포 대상으로 묶는다.
+  #   collector  → onprem/data/collector/overlays/onprem (Gitops 매니페스트는 노찬경 작성, ADR-21)
+  #   checkpoint → 학습 JobSet은 Backend가 렌더링하므로 digest를 받을 곳을 정한 뒤 켠다 (지금 경로는 자리표시)
+  deploy-targets:
+    name: deploy targets
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      count: ${{ steps.pick.outputs.count }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - id: pick
+        env:
+          DEPLOY_IMAGES: ${{ vars.DEPLOY_IMAGES }}
+        run: |
+          shopt -s nullglob
+          files=(digests/*.json)
+          enabled=" $(tr ',' ' ' <<<"$DEPLOY_IMAGES") "
+          matrix=$(jq -cs --arg enabled "$enabled" '
+            map(. as $i | select($enabled | contains(" " + $i.name + " ")))
+            | map(. + {overlay: "onprem/data/\(.name)/overlays/onprem"})' "${files[@]}" /dev/null)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq length <<<"$matrix")" >> "$GITHUB_OUTPUT"
+          echo "### 배포 대상 (DEPLOY_IMAGES=${DEPLOY_IMAGES:-비어 있음})" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.[] | "- \(.name) → \(.overlay)"' <<<"$matrix" >> "$GITHUB_STEP_SUMMARY"
+
+  # 로직은 Gitops 재사용 워크플로 한 곳 (Frontend · Backend · K8s와 같음). 봇 push 충돌을 피하려고 하나씩.
+  deploy:
+    name: gitops deploy (${{ matrix.name }})
+    needs: deploy-targets
+    if: needs.deploy-targets.outputs.count > 0
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.deploy-targets.outputs.matrix) }}
+    uses: DevOops-Team/Gitops/.github/workflows/update-image.yml@main
+    with:
+      image: ${{ matrix.image }}
+      digest: ${{ matrix.digest }}
+      overlay: ${{ matrix.overlay }}
+      app-id: ${{ vars.DEPLOY_APP_ID }}
+      gitops-repo: ${{ vars.GITOPS_REPO }}
+    secrets:
+      app-private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
