@@ -185,7 +185,9 @@ jobs:
 
   # push한 이미지 중 DEPLOY_IMAGES에 든 것만 배포 대상으로 묶는다.
   #   collector  → onprem/data/collector/overlays/onprem (Gitops 매니페스트는 노찬경 작성, ADR-21)
-  #   checkpoint → 학습 JobSet은 Backend가 렌더링하므로 digest를 받을 곳을 정한 뒤 켠다 (지금 경로는 자리표시)
+  #   checkpoint → onprem/platform/backend/overlays/onprem
+  #                학습 JobSet은 Backend가 렌더링한다. 봇이 이 overlay의 images에 digest를 넣으면
+  #                Backend env CHECKPOINT_IMAGE가 …@sha256으로 바뀌고 Backend가 rollout (Gitops #27)
   deploy-targets:
     name: deploy targets
     needs: image
@@ -209,7 +211,8 @@ jobs:
           enabled=" $(tr ',' ' ' <<<"$DEPLOY_IMAGES") "
           matrix=$(jq -cs --arg enabled "$enabled" '
             map(. as $i | select($enabled | contains(" " + $i.name + " ")))
-            | map(. + {overlay: "onprem/data/\(.name)/overlays/onprem"})' "${files[@]}" /dev/null)
+            | map(. + {overlay: ({checkpoint: "onprem/platform/backend/overlays/onprem"}[.name]
+                                  // "onprem/data/\(.name)/overlays/onprem")})' "${files[@]}" /dev/null)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "count=$(jq length <<<"$matrix")" >> "$GITHUB_OUTPUT"
           echo "### 배포 대상 (DEPLOY_IMAGES=${DEPLOY_IMAGES:-비어 있음})" >> "$GITHUB_STEP_SUMMARY"
