@@ -1,10 +1,25 @@
 name: collector
 
+# 수집기 이미지 ghcr.io/devoops-team/collector (ADR-26 GHCR, ADR-23 봇 배포)
+#   PR · develop push : 테스트 + 이미지 빌드 · 점검 (push 안 함)
+#   main push(머지)   : 같은 검사 → collector/ 나 이 파일이 바뀌었을 때만 push {main, sha-<7자리>}
+#                       → Variable DEPLOY_IMAGES에 collector가 있으면 봇이 Gitops overlay digest 갱신
+# 안 바뀐 이미지를 다시 push하면 digest가 달라져 불필요한 재배포가 생기므로 main에서도 바뀐 것만 push한다.
 # main 필수 검사로 쓰므로 경로 필터 없이 모든 PR에서 실행 (경로 필터가 있으면 해당 경로를 건드리지 않는 PR이 검사 대기로 막힘)
 on:
   pull_request:
   push:
     branches: [develop, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: collector-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/devoops-team/collector
 
 jobs:
   test:
@@ -32,11 +47,94 @@ jobs:
     name: collector · image
     runs-on: ubuntu-24.04
     needs: test
+    permissions:
+      contents: read
+      packages: write                     # GHCR push (GITHUB_TOKEN)
+    outputs:
+      image: ${{ env.IMAGE }}
+      digest: ${{ steps.push.outputs.digest }}
+      pushed: ${{ steps.changed.outputs.push }}
     steps:
       - uses: actions/checkout@v4
-      - name: 이미지 빌드 (push 안 함)
-        run: docker build -t devoops/collector:ci collector
+        with:
+          fetch-depth: 0
+      - id: changed
+        name: push 여부 (main push + 바뀐 경우만)
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          push=false
+          if [ "$EVENT" = push ] && [ "$REF" = refs/heads/main ]; then
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ] \
+               || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+               || git diff --name-only "$BEFORE" "$GITHUB_SHA" | grep -qE '^(collector/|\.github/workflows/collector\.yml$)'; then
+              push=true
+            fi
+          fi
+          echo "push=$push" >> "$GITHUB_OUTPUT"
+          echo "### collector push: $push" >> "$GITHUB_STEP_SUMMARY"
+      - uses: docker/setup-buildx-action@v3
+      - name: 이미지 빌드
+        uses: docker/build-push-action@v6
+        with:
+          context: collector
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: devoops/collector:ci
+          cache-from: type=gha,scope=collector
+          cache-to: type=gha,mode=max,scope=collector
       - name: 이미지 점검
         run: |
           docker run --rm devoops/collector:ci python -c "import collector.main, confluent_kafka, psycopg; print('ok')"
           test "$(docker run --rm devoops/collector:ci id -u)" = "1000"
+
+      - name: Log in to GHCR
+        if: steps.changed.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        if: steps.changed.outputs.push == 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=main
+            type=sha,prefix=sha-,format=short
+      - id: push
+        name: GHCR push (위와 같은 빌드, 캐시 재사용)
+        if: steps.changed.outputs.push == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: collector
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=collector
+      - if: steps.changed.outputs.push == 'true'
+        run: echo "### \`${IMAGE}@${{ steps.push.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # 로직은 Gitops 재사용 워크플로 한 곳 (Frontend · Backend · K8s와 같음).
+  # 수집기는 온프레미스 data-system에 Deployment로 뜬다 (ADR-13 · ADR-29).
+  # Variable DEPLOY_IMAGES(쉼표 목록)에 collector가 있을 때만 — Gitops overlay가 생긴 뒤 켠다.
+  deploy:
+    name: gitops deploy
+    needs: image
+    if: >-
+      needs.image.outputs.pushed == 'true' &&
+      contains(format(',{0},', vars.DEPLOY_IMAGES), ',collector,')
+    uses: DevOops-Team/Gitops/.github/workflows/update-image.yml@main
+    with:
+      image: ${{ needs.image.outputs.image }}
+      digest: ${{ needs.image.outputs.digest }}
+      overlay: onprem/data/collector/overlays/onprem
+      app-id: ${{ vars.DEPLOY_APP_ID }}
+      gitops-repo: ${{ vars.GITOPS_REPO }}
+    secrets:
+      app-private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
