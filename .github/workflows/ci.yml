@@ -3,6 +3,7 @@
 #   이미지                               폴더(Dockerfile)   쓰임
 #   ghcr.io/devoops-team/checkpoint      checkpoint/        학습 Pod의 ckpt-init(command: python -m ckpt.init_main) · ckpt-sidecar(기본 CMD) 공용
 #   ghcr.io/devoops-team/collector       collector/         Kafka 수집기, 온프레미스 data-system (ADR-13 · ADR-29)
+#   ghcr.io/devoops-team/job-watcher     job-watcher/       (잡) 감시기, 관리 클러스터 data-system (ADR-24 · ADR-29, GPU-118)
 #
 #   PR · develop push : 두 이미지 모두 테스트 + 이미지 빌드 · 점검 (push 안 함)
 #   main push(머지)   : 같은 검사 → 바뀐 폴더의 이미지만 push {main, sha-<7자리>}
@@ -43,7 +44,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
         run: |
-          all="checkpoint collector"
+          all="checkpoint collector job-watcher"
           if [ "$EVENT" != push ] || [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ] \
              || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
             images="$all"
@@ -55,6 +56,7 @@ jobs:
             if has '^\.github/workflows/ci\.yml$'; then images="$all"; else
               has '^checkpoint/' && images+=" checkpoint"
               has '^collector/'  && images+=" collector"
+              has '^job-watcher/' && images+=" job-watcher"
             fi
           fi
           images=$(echo $images)
@@ -77,6 +79,9 @@ jobs:
           - name: collector
             install: pip install -r requirements-dev.txt
             test: python -m pytest -q
+          - name: job-watcher
+            install: pip install -r requirements-dev.txt
+            test: python -m pytest -q          # 수집기 envelope.parse로 형식 호환도 확인
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -117,6 +122,10 @@ jobs:
           - name: collector
             check: |
               docker run --rm "$LOCAL" python -c "import collector.main, confluent_kafka, psycopg; print('ok')"
+              test "$(docker run --rm "$LOCAL" id -u)" = "1000"
+          - name: job-watcher
+            check: |
+              docker run --rm "$LOCAL" python -c "import watcher.main, kubernetes, confluent_kafka; print('ok')"
               test "$(docker run --rm "$LOCAL" id -u)" = "1000"
     env:
       IMAGE: ghcr.io/devoops-team/${{ matrix.name }}
