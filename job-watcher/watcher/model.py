@@ -6,7 +6,11 @@
 이름 · 라벨 규칙 (JobSet 템플릿 · ADR-12)
   이름   job-{작업ID}-g{세대 4자리}        예: job-3f9a1c2e-g0002
   라벨   devoops/generation · kueue.x-k8s.io/queue-name · (있으면) devoops/job-id
-  주석   devoops/recovery-id · (있으면) devoops/exp-id · devoops/config-sha256 · devoops/stop-reason
+  주석   devoops/recovery-id(재배치 실행기 재제출본에만) · (있으면) devoops/exp-id · devoops/config-sha256
+
+재배치 요청 RelocationRequest (scheduling.devoops.site, ADR-19): 복구 컨트롤러가 만들고 재배치 실행기가 처리한다.
+  spec.jobRef = "training/<옛 JobSet 이름>" · spec.requestId(= recovery_id) · spec.action
+  재배치 실행기가 옛 JobSet을 지울 때는 이 요청이 항상 먼저 있다 → 삭제 + 요청 있음 = fenced (김성모 11/12)
 """
 from __future__ import annotations
 
@@ -22,7 +26,6 @@ LABEL_QUEUE = "kueue.x-k8s.io/queue-name"
 ANN_EXP = "devoops/exp-id"
 ANN_RECOVERY = "devoops/recovery-id"
 ANN_CONFIG = "devoops/config-sha256"
-ANN_STOP = "devoops/stop-reason"      # 삭제하는 쪽이 붙임: relocate(재배치 실행기) · cancel(사용자 취소)
 GPU_RESOURCE = "nvidia.com/gpu"
 TRAINER = "trainer"
 
@@ -56,10 +59,12 @@ class Snapshot:
     cluster: str | None = None
     placed_at: str | None = None
     pods_ready_at: str | None = None
-    # 삭제
+    # 삭제 · 재배치 요청
     deleted: bool = False
     deleted_at: str | None = None
-    stop_reason: str | None = None
+    relocation_request_id: str | None = None
+    relocation_action: str | None = None
+    relocated: bool = False                  # 이 JobSet을 가리키는 RelocationRequest가 있음
 
 
 def job_ref(meta: dict[str, Any]) -> JobRef | None:
@@ -147,6 +152,16 @@ def workload_cluster(workload: dict[str, Any]) -> tuple[str | None, str | None]:
     return cluster, at
 
 
+def relocation_target(rr: dict[str, Any]) -> str | None:
+    """RelocationRequest가 가리키는 옛 JobSet 이름. spec.jobRef는 'training/<이름>' (객체 {namespace, name}도 받음)."""
+    ref = (rr.get("spec") or {}).get("jobRef")
+    if isinstance(ref, dict):
+        return ref.get("name")
+    if isinstance(ref, str) and ref:
+        return ref.split("/", 1)[-1]
+    return None
+
+
 def owner_jobset(workload: dict[str, Any]) -> str | None:
     for o in (workload.get("metadata") or {}).get("ownerReferences") or []:
         if o.get("kind") == "JobSet":
@@ -155,7 +170,7 @@ def owner_jobset(workload: dict[str, Any]) -> str | None:
 
 
 def snapshot(jobset: dict[str, Any], workload: dict[str, Any] | None = None, *,
-             deleted: bool = False) -> Snapshot | None:
+             deleted: bool = False, relocation: dict[str, Any] | None = None) -> Snapshot | None:
     meta = jobset.get("metadata") or {}
     ref = job_ref(meta)
     if ref is None:
@@ -168,8 +183,13 @@ def snapshot(jobset: dict[str, Any], workload: dict[str, Any] | None = None, *,
         image_digest=image_digest(jobset), all_ready=all_ready(jobset),
         completed_at=condition_time(jobset, "Completed"), failed_at=condition_time(jobset, "Failed"),
         failed_message=_condition_message(jobset, "Failed"),
-        deleted=deleted, deleted_at=meta.get("deletionTimestamp"), stop_reason=ann.get(ANN_STOP),
+        deleted=deleted, deleted_at=meta.get("deletionTimestamp"),
     )
+    if relocation is not None:
+        spec = relocation.get("spec") or {}
+        s.relocated = True
+        s.relocation_request_id = spec.get("requestId")
+        s.relocation_action = spec.get("action")
     if workload is not None:
         s.admitted_at = condition_time(workload, "Admitted")
         s.pods_ready_at = condition_time(workload, "PodsReady")

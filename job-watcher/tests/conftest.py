@@ -66,6 +66,14 @@ def workload(jobset_name: str, *, admitted: str | None = None, cluster: str | No
     }
 
 
+def relocation(jobset_name: str, request_id: str = "rec-7c21", action: str = "moveToSpare") -> dict[str, Any]:
+    return {
+        "apiVersion": "scheduling.devoops.site/v1alpha1", "kind": "RelocationRequest",
+        "metadata": {"name": f"rr-{request_id}", "namespace": "training"},
+        "spec": {"jobRef": f"training/{jobset_name}", "requestId": request_id, "action": action},
+    }
+
+
 class FakePublisher:
     def __init__(self):
         self.sent: list[tuple[str, str, dict]] = []

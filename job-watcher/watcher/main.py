@@ -1,18 +1,20 @@
 """(잡) 감시기 실행 루프.
 
 구조
-  [JobSet watch 스레드] ─┐
-                         ├─▶ 큐 ─▶ [처리 스레드: Watcher] ─▶ Kafka job.lifecycle
-  [Workload watch 스레드] ┘
+  [JobSet watch 스레드] ──────────────┐
+  [Workload watch 스레드] ────────────┼─▶ 큐 ─▶ [처리 스레드: Watcher] ─▶ Kafka job.lifecycle
+  [RelocationRequest watch 스레드] ───┘
 
 - 각 watch 스레드: list(현재 전부, SYNC) → 그 resourceVersion부터 watch(변화만). 끊기거나 410(Gone)이면 다시 list
-- Watcher: JobSet · Workload를 캐시에 두고, 바뀐 JobSet마다 rules.plan으로 사건을 고른 뒤
+- Watcher: JobSet · Workload · RelocationRequest를 캐시에 두고, 바뀐 JobSet마다 rules.plan으로 사건을 고른 뒤
   아직 안 보낸 것만 발행한다. 다시 list했을 때 캐시에 있던 JobSet이 없으면 그 사이 삭제된 것으로 본다.
 - 감시기가 재시작하면 캐시가 비어 있어 사건을 다시 보낸다 → event_id가 같아 수집기가 걸러냄
 
 환경 변수
   WATCH_NAMESPACE(training) · KAFKA_BOOTSTRAP(없으면 표준 출력) · KAFKA_TOPIC_LIFECYCLE(job.lifecycle)
-  JOBSET_API(jobset.x-k8s.io/v1alpha2) · WORKLOAD_API(kueue.x-k8s.io/v1beta2) · WATCH_TIMEOUT_S(300)
+  JOBSET_API(jobset.x-k8s.io/v1alpha2) · WORKLOAD_API(kueue.x-k8s.io/v1beta2)
+  RELOCATION_API(scheduling.devoops.site/v1alpha1) · WATCH_TIMEOUT_S(300)
+  EMIT_FIRST_SUBMITTED(false): 첫 제출 job.submitted는 Backend가 보내므로 기본으로 안 보냄
 """
 from __future__ import annotations
 
@@ -25,27 +27,32 @@ from typing import Any, Callable
 
 from . import events
 from .log import log, now_iso
-from .model import owner_jobset, snapshot
+from .model import owner_jobset, relocation_target, snapshot
 from .rules import plan
 
 SYNC, ADDED, MODIFIED, DELETED = "SYNC", "ADDED", "MODIFIED", "DELETED"
+KINDS = {"jobset", "workload", "relocation"}
 
 
 class Watcher:
     def __init__(self, publisher: events.Publisher, topic: str = "job.lifecycle",
-                 clock: Callable[[], str] = now_iso, *, wait_initial_sync: bool = True):
+                 clock: Callable[[], str] = now_iso, *, wait_initial_sync: bool = True,
+                 emit_first_submitted: bool = False):
         self.publisher, self.topic, self.clock = publisher, topic, clock
+        self.emit_first_submitted = emit_first_submitted
         self.jobsets: dict[str, dict[str, Any]] = {}          # 이름 → JobSet
         self.workloads: dict[str, dict[str, Any]] = {}        # JobSet 이름 → Workload
+        self.relocations: dict[str, dict[str, Any]] = {}      # 옛 JobSet 이름 → RelocationRequest
         self.sent: set[str] = set()                           # 이 프로세스에서 보낸 event_id
         # 시작 직후 JobSet 목록만 먼저 오면 started가 Workload PodsReady 시각 대신 본 시각으로 나가고,
-        # event_id가 같아 그 값이 DB에 남는다 → 두 목록을 다 받은 뒤부터 판정한다.
-        self._synced: set[str] = set() if wait_initial_sync else {"jobset", "workload"}
+        # 삭제를 재배치 요청 없이 보면 fenced가 stopped로 나간다. event_id가 같아 첫 판정이 DB에 남으므로
+        # 세 목록을 다 받은 뒤부터 판정한다.
+        self._synced: set[str] = set() if wait_initial_sync else set(KINDS)
         self._pending_deleted: list[dict[str, Any]] = []      # 준비 전에 삭제된 JobSet → 준비되면 처리
 
     @property
     def ready(self) -> bool:
-        return self._synced >= {"jobset", "workload"}
+        return self._synced >= KINDS
 
     def _mark_synced(self, kind: str) -> None:
         was_ready = self.ready
@@ -91,6 +98,20 @@ class Watcher:
             self.workloads[name] = obj
             self.evaluate(name)
 
+    def on_relocation(self, kind: str, obj: Any) -> None:
+        """재배치 요청은 캐시만 한다. 판정은 옛 JobSet이 지워질 때 (fenced vs stopped)."""
+        if kind == SYNC:
+            self.relocations = {t: o for o in obj if (t := relocation_target(o))}
+            self._mark_synced("relocation")
+            return
+        target = relocation_target(obj)
+        if not target:
+            return
+        if kind == DELETED:
+            self.relocations.pop(target, None)
+        else:
+            self.relocations[target] = obj
+
     # ---------- 판정 ----------
     def _upsert(self, obj: dict[str, Any]) -> None:
         name = obj["metadata"]["name"]
@@ -106,23 +127,15 @@ class Watcher:
             self._pending_deleted.append(obj)
         self.jobsets.pop(name, None)
 
-    def _newer_generation_exists(self, job_id: str, generation: int) -> bool:
-        for o in self.jobsets.values():
-            s = snapshot(o)
-            if s and s.job_id == job_id and s.generation > generation:
-                return True
-        return False
-
     def evaluate(self, name: str, *, obj: dict[str, Any] | None = None, deleted: bool = False) -> list[dict]:
         obj = obj or self.jobsets.get(name)
         if obj is None or not self.ready:
             return []
-        s = snapshot(obj, self.workloads.get(name), deleted=deleted)
+        s = snapshot(obj, self.workloads.get(name), deleted=deleted, relocation=self.relocations.get(name))
         if s is None:
             return []                                           # 이름 · 라벨 규칙 밖 → 우리 학습 JobSet 아님
         sent = []
-        for p in plan(s, newer_generation_exists=self._newer_generation_exists(s.job_id, s.generation),
-                      observed_at=self.clock()):
+        for p in plan(s, observed_at=self.clock(), emit_first_submitted=self.emit_first_submitted):
             ev = events.build(s, p)
             if ev["event_id"] in self.sent:
                 continue
@@ -185,9 +198,12 @@ def main() -> int:
     timeout_s = int(os.environ.get("WATCH_TIMEOUT_S", "300"))
     js_group, js_ver = _split(os.environ.get("JOBSET_API", "jobset.x-k8s.io/v1alpha2"))
     wl_group, wl_ver = _split(os.environ.get("WORKLOAD_API", "kueue.x-k8s.io/v1beta2"))
+    rr_group, rr_ver = _split(os.environ.get("RELOCATION_API", "scheduling.devoops.site/v1alpha1"))
+    emit_first = os.environ.get("EMIT_FIRST_SUBMITTED", "false").lower() in ("1", "true", "yes")
 
     publisher = events.from_env()
-    watcher = Watcher(publisher, topic)
+    watcher = Watcher(publisher, topic, emit_first_submitted=emit_first)
+    handlers = {"jobset": watcher.on_jobset, "workload": watcher.on_workload, "relocation": watcher.on_relocation}
     q: "queue.Queue[tuple[str, str, Any]]" = queue.Queue()
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -198,11 +214,13 @@ def main() -> int:
                          args=(api, js_group, js_ver, "jobsets", ns, "jobset", q, stop, timeout_s)),
         threading.Thread(target=_stream, daemon=True, name="workloads",
                          args=(api, wl_group, wl_ver, "workloads", ns, "workload", q, stop, timeout_s)),
+        threading.Thread(target=_stream, daemon=True, name="relocations",
+                         args=(api, rr_group, rr_ver, "relocationrequests", ns, "relocation", q, stop, timeout_s)),
     ]
     for t in threads:
         t.start()
     log("watcher.started", namespace=ns, topic=topic, jobset_api=f"{js_group}/{js_ver}",
-        workload_api=f"{wl_group}/{wl_ver}")
+        workload_api=f"{wl_group}/{wl_ver}", relocation_api=f"{rr_group}/{rr_ver}", emit_first_submitted=emit_first)
 
     while not stop.is_set():
         try:
@@ -210,7 +228,7 @@ def main() -> int:
         except queue.Empty:
             continue
         try:
-            (watcher.on_jobset if kind == "jobset" else watcher.on_workload)(etype, obj)
+            handlers[kind](etype, obj)
         except Exception as e:  # noqa: BLE001 — 객체 하나 때문에 감시기 전체가 멈추지 않게
             log("watcher.handle_failed", kind=kind, type=etype, error=repr(e))
 
