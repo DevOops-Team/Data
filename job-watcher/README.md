@@ -2,7 +2,7 @@
 
 관리 클러스터의 JobSet · Workload 상태 변화를 Kafka `job.lifecycle` 사건으로 올린다. 수집기가 이 사건으로 `data.job_runs`(세대별 제출 · 시작 · 종료 시각)를 채운다.
 
-기준: ADR-24(이름), ADR-29(위치: 관리 클러스터 Pod 1개), ADR-15(측정 지표), Jira GPU-118. 설명: Confluence 「(잡) 감시기 설계」 · 「(잡) 감시기 쉽게 보기」.
+기준: ADR-24(이름), ADR-29(위치: 관리 클러스터 Pod 1개), ADR-15(측정 지표), Jira GPU-118. 설명: Confluence 「(잡) 감시기 (GPU-118)」 (1부 쉽게 보기 · 2부 상세, 흐름도).
 
 | 파일 | 내용 |
 |---|---|
