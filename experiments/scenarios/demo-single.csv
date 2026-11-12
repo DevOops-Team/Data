@@ -1,0 +1,5 @@
+# 시연 · 장애 실험 1회 = 작업 1개 (GPU-77)
+# 제출 시각(초), GPU 수, step 수, 방식[, 실행 시간(초)]  — K8s scheduling/submitter 형식
+# gpt2 FSDP 2장 · step당 약 1.22초(11/12 E2E job 4734d7ac) → 1000 step ≈ 20분
+# 장애 주입 시점은 이 파일에 넣지 않는다: 첫 체크포인트 승인(job.lifecycle checkpoint.approved)을 확인한 뒤 주입
+0, 2, 1000, fsdp, 1200
