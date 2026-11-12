@@ -1,0 +1,3 @@
+# 런타임 (컨테이너 이미지에 들어가는 것)
+kubernetes>=31,<33        # 관리 클러스터 API list · watch
+confluent-kafka>=2.6,<3   # job.lifecycle 발행 (KAFKA_BOOTSTRAP 없으면 표준 출력으로만)
