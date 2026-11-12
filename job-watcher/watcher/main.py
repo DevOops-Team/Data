@@ -12,7 +12,7 @@
 
 환경 변수
   WATCH_NAMESPACE(training) · KAFKA_BOOTSTRAP(없으면 표준 출력) · KAFKA_TOPIC_LIFECYCLE(job.lifecycle)
-  JOBSET_API(jobset.x-k8s.io/v1alpha2) · WORKLOAD_API(kueue.x-k8s.io/v1beta1) · WATCH_TIMEOUT_S(300)
+  JOBSET_API(jobset.x-k8s.io/v1alpha2) · WORKLOAD_API(kueue.x-k8s.io/v1beta2) · WATCH_TIMEOUT_S(300)
 """
 from __future__ import annotations
 
@@ -184,7 +184,7 @@ def main() -> int:
     topic = os.environ.get("KAFKA_TOPIC_LIFECYCLE", "job.lifecycle")
     timeout_s = int(os.environ.get("WATCH_TIMEOUT_S", "300"))
     js_group, js_ver = _split(os.environ.get("JOBSET_API", "jobset.x-k8s.io/v1alpha2"))
-    wl_group, wl_ver = _split(os.environ.get("WORKLOAD_API", "kueue.x-k8s.io/v1beta1"))
+    wl_group, wl_ver = _split(os.environ.get("WORKLOAD_API", "kueue.x-k8s.io/v1beta2"))
 
     publisher = events.from_env()
     watcher = Watcher(publisher, topic)

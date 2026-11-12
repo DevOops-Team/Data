@@ -38,7 +38,7 @@ python -m watcher.main     # 클러스터 안이면 ServiceAccount, 밖이면 ~/
 | `KAFKA_BOOTSTRAP` | 없음 → 표준 출력으로만 (dry run) |
 | `KAFKA_TOPIC_LIFECYCLE` | `job.lifecycle` |
 | `JOBSET_API` | `jobset.x-k8s.io/v1alpha2` |
-| `WORKLOAD_API` | `kueue.x-k8s.io/v1beta1` |
+| `WORKLOAD_API` | `kueue.x-k8s.io/v1beta2` |
 | `WATCH_TIMEOUT_S` | `300` |
 | `KAFKA_MESSAGE_TIMEOUT_MS` | `1800000` |
 

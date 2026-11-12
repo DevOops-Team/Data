@@ -58,7 +58,7 @@ def workload(jobset_name: str, *, admitted: str | None = None, cluster: str | No
         status["admissionChecks"] = [{"name": "multikueue", "state": "Ready",
                                       "lastTransitionTime": cluster_at or admitted}]
     return {
-        "apiVersion": "kueue.x-k8s.io/v1beta1", "kind": "Workload",
+        "apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "Workload",
         "metadata": {"name": f"jobset-{jobset_name}-abcde", "namespace": "training",
                      "ownerReferences": [{"apiVersion": "jobset.x-k8s.io/v1alpha2", "kind": "JobSet",
                                           "name": jobset_name}]},
