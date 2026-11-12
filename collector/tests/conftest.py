@@ -52,8 +52,15 @@ def pg_dsn():
     with psycopg.connect(f"{base} user=postgres", autocommit=True) as c:
         c.execute((ROOT / "db" / "002_roles.sql").read_text())
         c.execute((ROOT / "db" / "002_roles.sql").read_text())  # 두 번 실행해도 안전한지
+    sql003 = (ROOT / "db" / "003_job_progress.sql").read_text()
+    with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:   # 운영처럼 테이블 소유자로
+        c.execute(sql003)
+        c.execute(sql003)                                        # 다시 실행해도 안전한지
+    with psycopg.connect(f"{base} user=postgres", autocommit=True) as c:
+        c.execute((ROOT / "db" / "004_backend_role.sql").read_text())
+        c.execute((ROOT / "db" / "004_backend_role.sql").read_text())
     yield {"owner": f"{base} user=data_app", "collector": f"{base} user=data_collector",
-           "exporter": f"{base} user=postgres_exporter"}
+           "exporter": f"{base} user=postgres_exporter", "backend": f"{base} user=backend_ro"}
     subprocess.run([PG_BIN / "pg_ctl", "-D", data, "-m", "immediate", "stop"], capture_output=True)
     shutil.rmtree(tmp, ignore_errors=True)
 
@@ -63,7 +70,7 @@ def conn(pg_dsn):
     """결과 확인용 소유자(data_app) 연결. 테이블을 비우고 시작한다."""
     c = psycopg.connect(pg_dsn["owner"], autocommit=True)
     c.execute("TRUNCATE data.events, data.event_rejects, data.results, data.checkpoints, data.job_runs, "
-              "data.experiments CASCADE")
+              "data.experiments, data.job_progress CASCADE")
     yield c
     c.close()
 

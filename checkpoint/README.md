@@ -44,6 +44,16 @@ rank 0 사이드카가 승인(OK · ALREADY)하면 `job.lifecycle` 토픽에 `ch
 - payload: `step` `format` `world_size` `manifest_key` `file_count` `size_bytes` `config_sha256`(필수, 수집기 기준) + `image_digest` `upload_ms`(rank 0 업로드) `saved_at`(.done 시각) `approved_at`
 - 최선 노력: Kafka 장애 · 전달 실패가 있어도 체크포인트 저장 · 승인은 그대로. 프로듀서는 `acks=all` · 멱등 · **30분**까지 재시도(`KAFKA_MESSAGE_TIMEOUT_MS`, 장애 복구 규약의 재개 대기 30분과 맞춤)
 
+### 진행률 사건 발행 (Kafka `job.progress`, GPU-141)
+
+rank 0 사이드카가 trainer가 쓰는 `PROGRESS_FILE`(`/progress/progress.json`)을 읽어 바뀌었을 때 `job.lifecycle`에 `job.progress`를 보낸다 → 수집기가 `data.job_progress`(작업당 1행)에 저장 → Backend가 `data.v_job_status`로 화면에 표시. 진행률 DynamoDB 테이블 · progress-reporter 사이드카를 대신한다 (`ckpt/progress.py`).
+
+- 환경 변수: `PROGRESS_FILE`(없으면 끔) · `PROGRESS_INTERVAL_SECONDS`(30)
+- 최소 30초 간격, 상태(`RUNNING` → `COMPLETED` · `FAILED`)가 바뀌면 바로, 사이드카 종료(SIGTERM) 때 남은 값 한 번 더
+- `event_id` = `progress-{job}-g{세대 4자리}-s{step 8자리}`, `RUNNING`이 아니면 끝에 `-{status 소문자}`
+- payload(파일에 있는 것만): `status` `step` `total_steps` `loss` `last_checkpoint_step` `checkpoint_every_steps` `checkpoint_count` `step_seconds`. `occurred_at` = 파일 갱신 시각
+- 다른 세대가 쓴 파일 · 쓰는 중인 파일은 무시. 발행 실패는 로그만 (학습 · 승인 영향 없음)
+
 ### S3 대기열 (outbox) — VPN이 끊겨도 사건을 잃지 않게
 
 EKS → 온프레 Kafka는 사이트 간 VPN을 지난다. 오래 끊기거나 그 사이 Pod가 교체되면 프로듀서 메모리에만 있던 사건이 사라진다. 그래서 Kafka로 못 보낸 사건은 S3에 보관했다가 다시 보낸다 (Confluence 「VPN 끊김 시 Kafka 사건 유실 문제」 제안 C).
