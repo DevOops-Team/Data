@@ -59,6 +59,9 @@ def derive(cur: Cursor, e: Event) -> str | None:
     if t in JOB_TYPES:
         _job_run(cur, e)
         return "job_runs"
+    if t == "job.progress":
+        _job_progress(cur, e)
+        return "job_progress"
     return None
 
 
@@ -102,6 +105,36 @@ def _experiment_ended(cur: Cursor, e: Event) -> None:
                 (e.occurred_at, e.payload["exp_id"]))
     if cur.rowcount == 0:
         raise DeriveSkip(f"experiments에 {e.payload['exp_id']} 없음 (experiment.started 먼저 필요)")
+
+
+# ---------- job_progress (GPU-141) ----------
+def _job_progress(cur: Cursor, e: Event) -> None:
+    """작업당 최신 1행. 순서가 뒤바뀌어 도착해도 (세대, 시각)이 더 새로울 때만 덮어쓴다."""
+    p = e.payload
+    _req(p, "step")
+    if not e.job_id or e.generation is None:
+        raise DeriveSkip("job_id · generation 없음")
+    cur.execute(
+        """INSERT INTO data.job_progress (job_id, generation, status, step, total_steps, loss, last_checkpoint_step,
+                                          checkpoint_every_steps, step_seconds, cluster, event_id, updated_at)
+           VALUES (%(job)s, %(gen)s, %(status)s, %(step)s, %(total)s, %(loss)s, %(lck)s, %(every)s, %(sec)s,
+                   %(cluster)s, %(eid)s, %(at)s)
+           ON CONFLICT (job_id) DO UPDATE SET
+             generation = EXCLUDED.generation, status = EXCLUDED.status, step = EXCLUDED.step,
+             total_steps = COALESCE(EXCLUDED.total_steps, data.job_progress.total_steps),
+             loss = EXCLUDED.loss,
+             last_checkpoint_step = COALESCE(EXCLUDED.last_checkpoint_step, data.job_progress.last_checkpoint_step),
+             checkpoint_every_steps = COALESCE(EXCLUDED.checkpoint_every_steps, data.job_progress.checkpoint_every_steps),
+             step_seconds = COALESCE(EXCLUDED.step_seconds, data.job_progress.step_seconds),
+             cluster = COALESCE(EXCLUDED.cluster, data.job_progress.cluster),
+             event_id = EXCLUDED.event_id, updated_at = EXCLUDED.updated_at
+           WHERE (EXCLUDED.generation, EXCLUDED.updated_at, EXCLUDED.step)
+                 >= (data.job_progress.generation, data.job_progress.updated_at, data.job_progress.step)""",
+        {"job": e.job_id, "gen": e.generation, "status": p.get("status"), "step": int(p["step"]),
+         "total": p.get("total_steps"), "loss": p.get("loss"), "lck": p.get("last_checkpoint_step"),
+         "every": p.get("checkpoint_every_steps"), "sec": p.get("step_seconds"),
+         "cluster": e.cluster or p.get("cluster"), "eid": e.event_id, "at": e.occurred_at},
+    )
 
 
 # ---------- checkpoints ----------

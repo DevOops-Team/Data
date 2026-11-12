@@ -9,6 +9,7 @@
 2. 승인된 step은 로컬에 .approved 생성 (rank 0 외에는 DynamoDB를 보고 확인)
 3. 오래된 로컬 step 정리 (최근 KEEP_LOCAL개 + 현재 승인본은 유지)
 4. rank 0: 하트비트 (HEARTBEAT_SECONDS 간격)
+5. rank 0: 학습 진행률(PROGRESS_FILE)이 바뀌었으면 Kafka job.progress 발행 (progress.py, GPU-141)
 """
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ from . import events, layout
 from .config import Config
 from .fencing import ApproveResult, FencingTable, now_iso
 from .log import log
+from .progress import ProgressReporter
 from .retry import is_transient
 from .storage import Store
 
@@ -34,9 +36,10 @@ class Sidecar:
     def __init__(self, cfg: Config, fencing: FencingTable, store: Store, *,
                  rank_wait_seconds: float | None = None, keep_local: int | None = None,
                  heartbeat_seconds: float | None = None, image_digest: str | None = None,
-                 publisher: events.Publisher | None = None):
+                 publisher: events.Publisher | None = None, progress: ProgressReporter | None = None):
         self.cfg, self.fencing, self.store = cfg, fencing, store
         self.publisher = publisher or events.NullPublisher()
+        self.progress = progress
         self.lifecycle_topic = os.environ.get("KAFKA_TOPIC_LIFECYCLE", "job.lifecycle")
         self._upload_ms: dict[int, int] = {}
         self.rank_wait = rank_wait_seconds if rank_wait_seconds is not None else float(os.environ.get("RANK_WAIT_SECONDS", "300"))
@@ -211,13 +214,28 @@ class Sidecar:
             if not is_transient(e):
                 raise
             log("sidecar.transient_skip", error=repr(e))
+        self.report_progress()
+
+    def report_progress(self, *, force: bool = False) -> None:
+        """진행률 발행은 업로드 · 승인 결과와 무관하게 매 tick 시도 (실패해도 사이드카는 계속)."""
+        if self.progress is None:
+            return
+        try:
+            self.progress.tick(force=force)
+        except Exception as e:  # noqa: BLE001
+            log("progress.error", error=repr(e))
 
 
 def main() -> None:
     cfg = Config.from_env()
     publisher = events.from_env(cfg.bucket, cfg.region) if cfg.rank == 0 else events.NullPublisher()   # 발행은 rank 0만
+    progress = None
+    if cfg.rank == 0 and os.environ.get("PROGRESS_FILE"):
+        progress = ProgressReporter(os.environ["PROGRESS_FILE"], job_id=cfg.job_id, generation=cfg.generation,
+                                    cluster=cfg.cluster, publisher=publisher,
+                                    topic=os.environ.get("KAFKA_TOPIC_LIFECYCLE", "job.lifecycle"))
     sc = Sidecar(cfg, FencingTable(cfg.table, region=cfg.region), Store(cfg.bucket, region=cfg.region),
-                 publisher=publisher)
+                 publisher=publisher, progress=progress)
     poll = float(os.environ.get("POLL_SECONDS", "2"))
     log("sidecar.start", job_id=cfg.job_id, gen=cfg.generation, rank=cfg.rank, world_size=cfg.world_size)
     once = "--once" in sys.argv
@@ -235,6 +253,7 @@ def main() -> None:
         if once or sc.stopped:
             break
         time.sleep(poll)
+    sc.report_progress(force=True)   # 마지막 진행률(COMPLETED 등)을 간격과 상관없이 한 번 더
     publisher.flush(5.0)   # 보내지 못한 사건이 있으면 최대 5초 기다림
     # STOP 후에도 Pod가 끝날 때까지 남아 있으면 되지만, 여기서는 그대로 종료한다.
 

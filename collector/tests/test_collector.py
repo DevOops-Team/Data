@@ -166,3 +166,58 @@ def test_late_experiment_links_all_generations(conn, collector_conn):
     rows = conn.execute("SELECT generation, exp_id, gpus FROM data.job_runs WHERE job_id='j-late' "
                         "ORDER BY generation").fetchall()
     assert rows == [(1, "exp-late", 2), (2, "exp-late", 2)]
+
+
+# ---------- GPU-141: job.progress · v_job_status ----------
+def _progress(step, at, *, gen=1, status="RUNNING", **extra):
+    return msg("job.progress", event_id=f"progress-3f9a1c2e-g{gen:04d}-s{step:08d}", job_id="3f9a1c2e",
+               generation=gen, cluster="eks-a", occurred_at=at,
+               payload={"status": status, "step": step, "total_steps": 2080, "loss": 3.0 - step / 1000, **extra})
+
+
+def test_job_progress_keeps_latest_one_row(conn, collector_conn):
+    run(collector_conn,
+        [_progress(100, "2026-11-16T10:01:00.000Z", step_seconds=1.2, checkpoint_every_steps=694),
+         _progress(300, "2026-11-16T10:05:00.000Z"),
+         _progress(200, "2026-11-16T10:03:00.000Z")])            # 늦게 도착한 옛 값은 덮지 않음
+    r = one(conn, "SELECT count(*), max(step), max(step_seconds), max(checkpoint_every_steps) FROM data.job_progress")
+    assert r == (1, 300, 1.2, 694)                                  # 빠진 칸은 이전 값 유지
+    run(collector_conn, [_progress(5, "2026-11-16T10:20:00.000Z", gen=2)])   # 새 세대는 step이 작아도 반영
+    assert one(conn, "SELECT generation, step FROM data.job_progress") == (2, 5)
+
+
+def test_job_progress_without_step_keeps_event(conn, collector_conn):
+    run(collector_conn, [msg("job.progress", job_id="3f9a1c2e", generation=1, payload={"status": "RUNNING"})])
+    assert one(conn, "SELECT count(*) FROM data.events WHERE type = 'job.progress'")[0] == 1
+    assert one(conn, "SELECT count(*) FROM data.job_progress")[0] == 0
+
+
+def test_v_job_status_latest_generation(conn, collector_conn):
+    run(collector_conn, [
+        msg("job.submitted", job_id="3f9a1c2e", generation=1, occurred_at="2026-11-16T10:00:00.000Z",
+            payload={"gpus": 2, "strategy": "fsdp", "queue": "queue-light"}),
+        msg("job.started", job_id="3f9a1c2e", generation=1, occurred_at="2026-11-16T10:01:00.000Z"),
+        msg("checkpoint.approved", job_id="3f9a1c2e", generation=1, occurred_at="2026-11-16T10:10:00.000Z",
+            payload={"step": 694, "format": "fsdp-dcp", "world_size": 2, "manifest_key": "m", "file_count": 3,
+                     "size_bytes": 1, "config_sha256": "c"}),
+        msg("job.fenced", job_id="3f9a1c2e", generation=1, occurred_at="2026-11-16T10:12:00.000Z"),
+        msg("job.submitted", job_id="3f9a1c2e", generation=2, occurred_at="2026-11-16T10:13:00.000Z"),
+        msg("job.resumed", job_id="3f9a1c2e", generation=2, occurred_at="2026-11-16T10:14:00.000Z"),
+        _progress(800, "2026-11-16T10:16:00.000Z", gen=2),
+        _progress(650, "2026-11-16T10:11:00.000Z", gen=1),           # 옛 세대 값은 반영 안 됨
+    ])
+    r = one(conn, """SELECT generation, state, recovery_count, step, total_steps, last_approved_step,
+                            last_approved_generation FROM data.v_job_status WHERE job_id = '3f9a1c2e'""")
+    assert r == (2, "RUNNING", 1, 800, 2080, 694, 1)
+
+
+def test_backend_ro_reads_status_but_cannot_write(pg_dsn, conn):
+    with psycopg.connect(pg_dsn["backend"], autocommit=True) as ro:
+        ro.execute("SELECT * FROM data.v_job_status").fetchall()
+        for sql in ("INSERT INTO data.job_progress (job_id, generation, step, event_id, updated_at) "
+                    "VALUES ('x', 1, 1, 'e', now())", "SELECT * FROM data.events"):
+            try:
+                ro.execute(sql)
+            except psycopg.errors.InsufficientPrivilege:
+                continue
+            raise AssertionError(f"backend_ro should not run: {sql}")
