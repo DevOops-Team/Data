@@ -5,14 +5,15 @@
 #   ghcr.io/devoops-team/collector       collector/         Kafka 수집기, 온프레미스 data-system (ADR-13 · ADR-29)
 #   ghcr.io/devoops-team/job-watcher     job-watcher/       (잡) 감시기, 관리 클러스터 data-system (ADR-24 · ADR-29, GPU-118)
 #
-#   PR · develop push : 두 이미지 모두 테스트 + 이미지 빌드 · 점검 (push 안 함)
+#   PR · develop push : 세 이미지 모두 테스트 + 이미지 빌드 · 점검 (push 안 함)
 #   main push(머지)   : 같은 검사 → 바뀐 폴더의 이미지만 push {main, sha-<7자리>}
 #                       → Variable DEPLOY_IMAGES(쉼표 목록, 공백 없이)에 든 이미지만 봇이 Gitops overlay digest 갱신
 #
-# main 필수 검사: "checkpoint · test" · "checkpoint · image" · "collector · test" · "collector · image" (matrix job 이름).
+# main 필수 검사: "<이름> · test" · "<이름> · image" (checkpoint · collector · job-watcher, matrix job 이름).
+#   이미지를 더하면 저장소 설정(브랜치 보호)의 필수 검사에도 두 개를 더한다.
 #   경로 필터를 걸면 해당 경로를 건드리지 않는 PR이 검사 대기로 막히므로 모든 PR에서 전부 돈다.
 # 안 바뀐 이미지를 다시 push하면 digest가 달라져 불필요한 재배포가 생기므로 main에서도 바뀐 것만 push한다.
-# 새 이미지 추가: matrix.include 두 곳(test · image)과 changes job의 판정에 한 줄씩.
+# 새 이미지 추가: matrix.include 두 곳(test · image)과 changes job의 판정에 한 줄씩, 배포하려면 아래 deploy-targets 표에도.
 name: CI
 
 on:
@@ -193,7 +194,8 @@ jobs:
           retention-days: 1
 
   # push한 이미지 중 DEPLOY_IMAGES에 든 것만 배포 대상으로 묶는다.
-  #   collector  → onprem/data/collector/overlays/onprem (Gitops 매니페스트는 노찬경 작성, ADR-21)
+  #   collector   → onprem/data/collector/overlays/onprem (Gitops 매니페스트는 노찬경 작성, ADR-21)
+  #   job-watcher → onprem/data/job-watcher/overlays/onprem (Pod 1개 · Recreate, GPU-145)
   #   checkpoint → onprem/platform/backend/overlays/onprem
   #                학습 JobSet은 Backend가 렌더링한다. 봇이 이 overlay의 images에 digest를 넣으면
   #                Backend env CHECKPOINT_IMAGE가 …@sha256으로 바뀌고 Backend가 rollout (Gitops #27)
