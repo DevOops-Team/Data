@@ -4,12 +4,14 @@
 #   ghcr.io/devoops-team/checkpoint      checkpoint/        학습 Pod의 ckpt-init(command: python -m ckpt.init_main) · ckpt-sidecar(기본 CMD) 공용
 #   ghcr.io/devoops-team/collector       collector/         Kafka 수집기, 온프레미스 data-system (ADR-13 · ADR-29)
 #   ghcr.io/devoops-team/job-watcher     job-watcher/       (잡) 감시기, 관리 클러스터 data-system (ADR-24 · ADR-29, GPU-118)
+#   ghcr.io/devoops-team/trainer         trainer/           학습 Pod의 trainer 컨테이너 = 학습 환경만 (torch · CUDA · transformers).
+#                                                           train.py는 사용자가 올리고 ckpt-init이 /data/code/train.py로 넣는다 (GPU-153 · GPU-154)
 #
-#   PR · develop push : 세 이미지 모두 테스트 + 이미지 빌드 · 점검 (push 안 함)
+#   PR · develop push : 네 이미지 모두 테스트 + 이미지 빌드 · 점검 (push 안 함)
 #   main push(머지)   : 같은 검사 → 바뀐 폴더의 이미지만 push {main, sha-<7자리>}
 #                       → Variable DEPLOY_IMAGES(쉼표 목록, 공백 없이)에 든 이미지만 봇이 Gitops overlay digest 갱신
 #
-# main 필수 검사: "<이름> · test" · "<이름> · image" (checkpoint · collector · job-watcher, matrix job 이름).
+# main 필수 검사: "<이름> · test" · "<이름> · image" (checkpoint · collector · job-watcher · trainer, matrix job 이름).
 #   이미지를 더하면 저장소 설정(브랜치 보호)의 필수 검사에도 두 개를 더한다.
 #   경로 필터를 걸면 해당 경로를 건드리지 않는 PR이 검사 대기로 막히므로 모든 PR에서 전부 돈다.
 # 안 바뀐 이미지를 다시 push하면 digest가 달라져 불필요한 재배포가 생기므로 main에서도 바뀐 것만 push한다.
@@ -45,7 +47,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
         run: |
-          all="checkpoint collector job-watcher"
+          all="checkpoint collector job-watcher trainer"
           if [ "$EVENT" != push ] || [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ] \
              || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
             images="$all"
@@ -58,6 +60,7 @@ jobs:
               has '^checkpoint/' && images+=" checkpoint"
               has '^collector/'  && images+=" collector"
               has '^job-watcher/' && images+=" job-watcher"
+              has '^trainer/'     && images+=" trainer"
             fi
           fi
           images=$(echo $images)
@@ -83,6 +86,9 @@ jobs:
           - name: job-watcher
             install: pip install -r requirements-dev.txt
             test: python -m pytest -q          # 수집기 envelope.parse로 형식 호환도 확인
+          - name: trainer
+            install: python --version          # 기본 train.py 순수 함수만 (torch 불필요)
+            test: python -m unittest -v test_train.py
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -128,12 +134,24 @@ jobs:
             check: |
               docker run --rm "$LOCAL" python -c "import watcher.main, kubernetes, confluent_kafka; print('ok')"
               test "$(docker run --rm "$LOCAL" id -u)" = "1000"
+          - name: trainer
+            check: |
+              # 학습 환경만: torch · transformers가 있고 train.py는 이미지에 없다 (사용자 업로드, /data/code/train.py)
+              docker run --rm "$LOCAL" python -c "import torch, transformers, safetensors, sentencepiece, tokenizers; print(torch.__version__, transformers.__version__)"
+              test "$(docker run --rm "$LOCAL" id -u)" = "1000"
+              docker run --rm "$LOCAL" sh -c 'test ! -e /opt/train/train.py'
     env:
       IMAGE: ghcr.io/devoops-team/${{ matrix.name }}
       LOCAL: devoops/${{ matrix.name }}:ci
+      # PyTorch CUDA 베이스(압축 3GB대)는 GHA 캐시(저장소 10GB)를 다 차지하므로 trainer는 캐시를 쓰지 않는다
+      CACHE_FROM: ${{ matrix.name != 'trainer' && format('type=gha,scope={0}', matrix.name) || '' }}
+      CACHE_TO: ${{ matrix.name != 'trainer' && format('type=gha,mode=max,scope={0}', matrix.name) || '' }}
       PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(format(' {0} ', needs.changes.outputs.images), format(' {0} ', matrix.name)) }}
     steps:
       - uses: actions/checkout@v4
+      - name: 디스크 비우기 (PyTorch CUDA 베이스가 커서)
+        if: matrix.name == 'trainer'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
       - uses: docker/setup-buildx-action@v3
       - name: 이미지 빌드
         uses: docker/build-push-action@v6
@@ -143,8 +161,8 @@ jobs:
           load: true
           push: false
           tags: ${{ env.LOCAL }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          cache-from: ${{ env.CACHE_FROM }}
+          cache-to: ${{ env.CACHE_TO }}
       - name: 이미지 점검
         run: ${{ matrix.check }}
 
@@ -175,7 +193,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-from: ${{ env.CACHE_FROM }}
 
       # matrix job 출력은 마지막 한 개만 남으므로 이미지별 digest는 artifact로 넘긴다.
       - name: Record digest
@@ -199,6 +217,7 @@ jobs:
   #   checkpoint → onprem/platform/backend/overlays/onprem
   #                학습 JobSet은 Backend가 렌더링한다. 봇이 이 overlay의 images에 digest를 넣으면
   #                Backend env CHECKPOINT_IMAGE가 …@sha256으로 바뀌고 Backend가 rollout (Gitops #27)
+  #   trainer    → onprem/platform/backend/overlays/onprem (같은 overlay, Backend env TRAINER_IMAGE, GPU-154)
   deploy-targets:
     name: deploy targets
     needs: image
@@ -222,7 +241,8 @@ jobs:
           enabled=" $(tr ',' ' ' <<<"$DEPLOY_IMAGES") "
           matrix=$(jq -cs --arg enabled "$enabled" '
             map(. as $i | select($enabled | contains(" " + $i.name + " ")))
-            | map(. + {overlay: ({checkpoint: "onprem/platform/backend/overlays/onprem"}[.name]
+            | map(. + {overlay: ({checkpoint: "onprem/platform/backend/overlays/onprem",
+                                   trainer: "onprem/platform/backend/overlays/onprem"}[.name]
                                   // "onprem/data/\(.name)/overlays/onprem")})' "${files[@]}" /dev/null)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "count=$(jq length <<<"$matrix")" >> "$GITHUB_OUTPUT"
