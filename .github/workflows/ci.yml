@@ -8,8 +8,14 @@
 #                                                           train.py는 사용자가 올리고 ckpt-init이 /data/code/train.py로 넣는다 (GPU-153 · GPU-154)
 #
 #   PR · develop push : 네 이미지 모두 테스트 + 이미지 빌드 · 점검 (push 안 함)
-#   main push(머지)   : 같은 검사 → 바뀐 폴더의 이미지만 push {main, sha-<7자리>}
-#                       → Variable DEPLOY_IMAGES(쉼표 목록, 공백 없이)에 든 이미지만 봇이 Gitops overlay digest 갱신
+#   main push(머지)   : 같은 검사 → 릴리스 버전 계산 → 바뀐 폴더의 이미지만 push {X.Y.Z, X.Y, main, sha-<7자리>}
+#                       → 버전 봇이 태그 vX.Y.Z · Release 생성
+#                       → Variable DEPLOY_IMAGES(쉼표 목록, 공백 없이)에 든 이미지만 배포 봇이 Gitops overlay에 X.Y.Z@digest 반영
+#
+# 버전은 레포 단위 하나 (GPU-136). develop → main PR 본문의 '## 릴리스 노트'에서 버전 · description이 나오고
+#   (형식은 .github/pull_request_template.md), 이번 머지에서 바뀐 이미지에만 그 버전 태그가 붙는다.
+#   main 머지 커밋이 PR 머지가 아니거나 릴리스 노트가 없으면 push · 배포를 하지 않는다.
+#   main 필수 검사에 "release-notes / release notes"(release-notes.yml)도 들어간다.
 #
 # main 필수 검사: "<이름> · test" · "<이름> · image" (checkpoint · collector · job-watcher · trainer, matrix job 이름).
 #   이미지를 더하면 저장소 설정(브랜치 보호)의 필수 검사에도 두 개를 더한다.
@@ -32,6 +38,14 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # 버전 계산 (main push에서만 release=true). 로직은 Gitops 재사용 워크플로.
+  plan:
+    name: version
+    uses: DevOops-Team/Gitops/.github/workflows/release-plan.yml@main
+    permissions:
+      contents: read
+      pull-requests: read
+
   # main push에서 push · 배포할 이미지 고르기 (자기 폴더 · 이 파일 기준)
   changes:
     name: changes
@@ -111,7 +125,7 @@ jobs:
 
   image:
     name: ${{ matrix.name }} · image
-    needs: [changes, test]
+    needs: [changes, test, plan]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -146,7 +160,7 @@ jobs:
       # PyTorch CUDA 베이스(압축 3GB대)는 GHA 캐시(저장소 10GB)를 다 차지하므로 trainer는 캐시를 쓰지 않는다
       CACHE_FROM: ${{ matrix.name != 'trainer' && format('type=gha,scope={0}', matrix.name) || '' }}
       CACHE_TO: ${{ matrix.name != 'trainer' && format('type=gha,mode=max,scope={0}', matrix.name) || '' }}
-      PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(format(' {0} ', needs.changes.outputs.images), format(' {0} ', matrix.name)) }}
+      PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.release == 'true' && contains(format(' {0} ', needs.changes.outputs.images), format(' {0} ', matrix.name)) }}
     steps:
       - uses: actions/checkout@v4
       - name: 디스크 비우기 (PyTorch CUDA 베이스가 커서)
@@ -179,10 +193,15 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
+            type=semver,pattern={{version}},value=${{ needs.plan.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.plan.outputs.version }}
             type=raw,value=main
             type=sha,prefix=sha-,format=short
           labels: |
             org.opencontainers.image.title=${{ matrix.name }}
+            org.opencontainers.image.description=${{ needs.plan.outputs.description }}
+          annotations: |
+            org.opencontainers.image.description=${{ needs.plan.outputs.description }}
       - id: push
         name: GHCR push (위와 같은 빌드, 캐시 재사용)
         if: env.PUSH == 'true'
@@ -193,6 +212,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: ${{ env.CACHE_FROM }}
 
       # matrix job 출력은 마지막 한 개만 남으므로 이미지별 digest는 artifact로 넘긴다.
@@ -220,8 +240,8 @@ jobs:
   #   trainer    → onprem/platform/backend/overlays/onprem (같은 overlay, Backend env TRAINER_IMAGE, GPU-154)
   deploy-targets:
     name: deploy targets
-    needs: image
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [image, plan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.release == 'true'
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
@@ -249,10 +269,23 @@ jobs:
           echo "### 배포 대상 (DEPLOY_IMAGES=${DEPLOY_IMAGES:-비어 있음})" >> "$GITHUB_STEP_SUMMARY"
           jq -r '.[] | "- \(.name) → \(.overlay)"' <<<"$matrix" >> "$GITHUB_STEP_SUMMARY"
 
+  # GPU-136: 이미지 push가 끝난 뒤 버전 봇이 태그 vX.Y.Z · Release를 만든다 (바뀐 이미지가 없어도 레포 버전은 올라감).
+  #   Variable VERSION_APP_ID, 비밀키는 Environment release(main만)의 Secret VERSION_APP_PRIVATE_KEY.
+  release:
+    name: release
+    needs: [plan, image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.release == 'true'
+    uses: DevOops-Team/Gitops/.github/workflows/release-publish.yml@main
+    with:
+      tag: ${{ needs.plan.outputs.tag }}
+      notes: ${{ needs.plan.outputs.notes }}
+      app-id: ${{ vars.VERSION_APP_ID }}
+
   # 로직은 Gitops 재사용 워크플로 한 곳 (Frontend · Backend · K8s와 같음). 봇 push 충돌을 피하려고 하나씩.
+  #   비밀키는 Environment gitops-deploy(main만)의 Secret DEPLOY_APP_PRIVATE_KEY (GPU-136).
   deploy:
     name: gitops deploy (${{ matrix.name }})
-    needs: deploy-targets
+    needs: [deploy-targets, plan, release]
     if: needs.deploy-targets.outputs.count > 0
     strategy:
       max-parallel: 1
@@ -263,8 +296,7 @@ jobs:
     with:
       image: ${{ matrix.image }}
       digest: ${{ matrix.digest }}
+      version: ${{ needs.plan.outputs.version }}
       overlay: ${{ matrix.overlay }}
       app-id: ${{ vars.DEPLOY_APP_ID }}
       gitops-repo: ${{ vars.GITOPS_REPO }}
-    secrets:
-      app-private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
