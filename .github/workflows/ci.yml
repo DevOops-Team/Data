@@ -280,6 +280,8 @@ jobs:
       tag: ${{ needs.plan.outputs.tag }}
       notes: ${{ needs.plan.outputs.notes }}
       app-id: ${{ vars.VERSION_APP_ID }}
+    secrets:
+      VERSION_APP_PRIVATE_KEY: ${{ secrets.VERSION_APP_PRIVATE_KEY }}   # 이름으로 넘김 — 값은 Environment release(main만)
 
   # 로직은 Gitops 재사용 워크플로 한 곳 (Frontend · Backend · K8s와 같음). 봇 push 충돌을 피하려고 하나씩.
   #   비밀키는 Environment gitops-deploy(main만)의 Secret DEPLOY_APP_PRIVATE_KEY (GPU-136).
@@ -300,3 +302,5 @@ jobs:
       overlay: ${{ matrix.overlay }}
       app-id: ${{ vars.DEPLOY_APP_ID }}
       gitops-repo: ${{ vars.GITOPS_REPO }}
+    secrets:
+      DEPLOY_APP_PRIVATE_KEY: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}     # 이름으로 넘김 — 값은 Environment gitops-deploy(main만)
