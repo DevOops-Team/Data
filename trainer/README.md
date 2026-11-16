@@ -9,7 +9,10 @@ ckpt-init이 모델 · 데이터와 함께 `/data/code/train.py`로 받아 train
 - ckpt-sidecar 약속: `step-N/` 뒤 `step-N.done`, `STOP`이면 종료 코드 75, 마지막 저장 뒤 `.approved`를 120초 기다림
 - 재개: ckpt-init이 승인본을 `/ckpt/step-N/`에 받고 `/ckpt/resume.json`을 남기면 그 step의 모델 · 옵티마이저(Adam 모멘트)를 불러와
   step N 다음부터 같은 데이터 순서로 이어 간다 (GPU-119). 옵티마이저는 `state`만 저장하고 `param_groups`(lr · betas 등)는 코드 · 스케줄이 정한다
-- 테스트: `cd trainer && python3 -m unittest test_train.py` (torch 없이 순수 함수만)
+- 학습 지표 (GPU-96): 모든 rank가 `:8000/metrics`(env `METRICS_PORT`, 0이면 끔)로 8개를 연다 — 이름 · 라벨 · 버킷은 Monitoring 레포 `docs/training-metrics.md`.
+  `train_step_seconds`(저장 전까지) · `train_data_wait_seconds` · `train_current_step` · `train_loss`(전체 rank 평균) · `train_stage` · `train_last_checkpoint_step`,
+  `train_rank_compute_seconds` · `train_rank_comm_seconds`는 `PROFILE_EVERY`(기본 25) step마다 1 step만 torch.profiler로 (GPU에서만). JobSet: trainer `containerPort: 8000` + Pod `prometheus.io/*` 어노테이션
+- 테스트: `cd trainer && python3 -m unittest test_train.py` (torch 없이 순수 함수만, prometheus_client가 있으면 /metrics 노출까지)
 - 재개 확인: `python3 trainer/examples/resume_check.py` (torch만, CPU · 2 프로세스) — 끊김 없이 6 step = 3 step 저장 → 새로 불러와 3 step, FSDP · DDP 최종 가중치 차이 0. torch 2.5.1(이미지와 같음) · 2.15에서 통과
 - 직접 쓴 train.py도 위 환경 변수 · 체크포인트 규약(`TRAIN_CONFIG` · `DATA_DIR` · `CKPT_DIR` · `PROGRESS_FILE`, `.done`, `STOP`)을 따라야 저장 · 재개가 된다
 - CI: 이 레포 `.github/workflows/ci.yml` matrix `trainer`. `trainer/`가 바뀐 main push에서 이미지 push → `DEPLOY_IMAGES`에 trainer가 있으면 봇이 Gitops `onprem/platform/backend/overlays/onprem`의 `images:` digest 갱신 → Backend env `TRAINER_IMAGE`

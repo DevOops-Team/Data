@@ -169,6 +169,105 @@ class ProgressFile:
         os.replace(tmp, self.path)
 
 
+STAGES = ("init", "train", "checkpoint", "finalize")
+STEP_BUCKETS = (0.1, 0.3, 1, 3, 10, 30)  # 초. Monitoring docs/training-metrics.md 3절
+PROFILE_EVERY = 25  # N step마다 1 step만 프로파일 (규약 3-1절, 실측 뒤 조정)
+
+
+def metric_labels(env) -> dict:
+    """규약 2절: job_id · generation · rank(= Pod 번호 JOB_COMPLETION_INDEX)."""
+    rank = env.get("JOB_COMPLETION_INDEX", env.get("RANK", "0"))
+    return {"job_id": env.get("JOB_ID", "unknown"), "generation": str(env.get("GENERATION", "0")), "rank": str(rank)}
+
+
+def phase_of(step: int, warmup_steps: int) -> str:
+    return "warmup" if step <= warmup_steps else "steady"
+
+
+def split_kernel_seconds(events) -> tuple[float, float]:
+    """프로파일된 커널 이벤트 → (계산 초, NCCL 초). 이름에 nccl이 들어가면 통신 + 대기 (규약 3-1절)."""
+    comp = comm = 0.0
+    for e in events:
+        us = getattr(e, "self_device_time_total", None)
+        if us is None:  # torch 2.3 이하 이름
+            us = getattr(e, "self_cuda_time_total", 0.0)
+        if "nccl" in e.name.lower():
+            comm += us
+        else:
+            comp += us
+    return comp / 1e6, comm / 1e6
+
+
+class Metrics:
+    """학습 지표 8개를 /metrics로 연다 (GPU-96, Monitoring docs/training-metrics.md).
+
+    prometheus_client가 없거나 METRICS_PORT=0이면 아무것도 하지 않는다 (학습은 그대로).
+    """
+
+    def __init__(self, labels: dict, port: int):
+        self.on = False
+        self.labels = labels
+        try:
+            from prometheus_client import CollectorRegistry, Gauge, Histogram, start_http_server
+        except ImportError:
+            return
+        if port <= 0:
+            return
+        r = self.registry = CollectorRegistry()
+        base = ["job_id", "generation", "rank"]
+        self.step_seconds = Histogram("train_step_seconds", "한 step 벽시계 시간", base + ["phase"], buckets=STEP_BUCKETS, registry=r)
+        self.data_wait = Histogram("train_data_wait_seconds", "step 시작부터 배치가 GPU에 올라올 때까지", base + ["phase"],
+                                   buckets=STEP_BUCKETS, registry=r)
+        self.compute = Gauge("train_rank_compute_seconds", "프로파일된 step의 계산 커널 시간 합", base, registry=r)
+        self.comm = Gauge("train_rank_comm_seconds", "프로파일된 step의 NCCL 커널 시간 합", base, registry=r)
+        self.current_step = Gauge("train_current_step", "완료한 global step", base, registry=r)
+        self.loss = Gauge("train_loss", "마지막 step loss (전체 rank 평균)", base, registry=r)
+        self.stage_g = Gauge("train_stage", "현재 단계 (해당 단계만 1)", base + ["stage"], registry=r)
+        self.last_ckpt = Gauge("train_last_checkpoint_step", "마지막으로 .done을 만든 step", base, registry=r)
+        start_http_server(port, registry=r)
+        self.on = True
+
+    def stage(self, name: str) -> None:
+        if self.on:
+            for s in STAGES:
+                self.stage_g.labels(**self.labels, stage=s).set(1 if s == name else 0)
+
+    def step(self, step: int, loss: float, step_seconds: float, data_wait: float, phase: str) -> None:
+        if self.on:
+            self.step_seconds.labels(**self.labels, phase=phase).observe(step_seconds)
+            self.data_wait.labels(**self.labels, phase=phase).observe(data_wait)
+            self.current_step.labels(**self.labels).set(step)
+            self.loss.labels(**self.labels).set(loss)
+
+    def checkpoint(self, step: int) -> None:
+        if self.on:
+            self.last_ckpt.labels(**self.labels).set(step)
+
+    def kernels(self, events) -> None:
+        if self.on:
+            comp, comm = split_kernel_seconds(events)
+            self.compute.labels(**self.labels).set(comp)
+            self.comm.labels(**self.labels).set(comm)
+
+
+def start_profiler(metrics: Metrics, every: int):
+    """N step마다 1 step만 CUDA 커널 시간을 잰다. 지표가 꺼졌거나 GPU가 없거나 N <= 2면 None."""
+    import torch
+
+    if not metrics.on or every <= 2 or not torch.cuda.is_available():
+        return None
+    from torch.autograd import DeviceType
+    from torch.profiler import ProfilerActivity, profile, schedule
+
+    def ready(prof):
+        metrics.kernels(e for e in prof.events() if e.device_type == DeviceType.CUDA)
+
+    prof = profile(activities=[ProfilerActivity.CUDA], schedule=schedule(wait=every - 2, warmup=1, active=1),
+                   on_trace_ready=ready, record_shapes=False, with_stack=False)
+    prof.start()
+    return prof
+
+
 def read_tokens(paths, tokenizer):
     ids = []
     eos = tokenizer.eos_token_id
@@ -375,6 +474,9 @@ def main():
     ckpt_dir = os.environ["CKPT_DIR"]
     data_dir = os.environ["DATA_DIR"]
     progress = ProgressFile(os.environ.get("PROGRESS_FILE", "") if rank == 0 else "", int(os.environ["GENERATION"]))
+    metrics = Metrics(metric_labels(os.environ), int(os.environ.get("METRICS_PORT", "8000")))  # 모든 rank (GPU-96)
+    metrics.stage("init")
+    prof = None
     try:
         if world != cfg.world_size:
             raise SystemExit(f"WORLD_SIZE {world} != config.world_size {cfg.world_size}")
@@ -421,11 +523,17 @@ def main():
         measure_start = None
         step = start
         last_saved = start
+        if start:
+            metrics.checkpoint(start)
+        metrics.stage("train")
+        prof = start_profiler(metrics, int(os.environ.get("PROFILE_EVERY", PROFILE_EVERY)))
+        mark = time.perf_counter()  # step 시작 = 이전 step이 끝난 때 (배치 가져오기 포함)
         while step < total:
             sampler.set_epoch(epoch)
             for (batch,) in loader:
                 if skip:  # 재개한 epoch에서 이미 학습한 배치 (같은 seed · epoch라 순서가 같다)
                     skip -= 1
+                    mark = time.perf_counter()
                     continue
                 if stop_requested(ckpt_dir):
                     print(f"rank {rank}: STOP at step {step}", flush=True)
@@ -437,6 +545,7 @@ def main():
                 for group in optimizer.param_groups:
                     group["lr"] = lr_at(step, cfg.learning_rate, cfg.warmup_steps, total)
                 x = batch.to(device)
+                data_wait = time.perf_counter() - mark  # 집합 통신 전이라 rank마다 다르게 나온다
                 optimizer.zero_grad(set_to_none=True)
                 loss = model(input_ids=x, labels=x).loss  # labels를 한 칸 밀어 다음 토큰을 맞히는 건 모델이 한다
                 loss.backward()
@@ -446,6 +555,8 @@ def main():
                 reduced = loss.detach().clone()  # 화면에는 전체 rank 평균을 보여 준다
                 dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
                 values = {"step": step, "loss": float(reduced.item()) / world}
+                # step 시간: .item()까지(이미 동기화됨), 저장 전 — 저장 step이 스트래글러처럼 보이지 않게
+                metrics.step(step, values["loss"], time.perf_counter() - mark, data_wait, phase_of(step, cfg.warmup_steps))
 
                 if every is None and step >= measure_until and measure_start is not None:
                     torch.cuda.synchronize()
@@ -460,15 +571,25 @@ def main():
                               flush=True)
 
                 if step == total or (every is not None and step % every == 0):  # 마지막 step은 항상 저장
+                    metrics.stage("checkpoint")  # 저장 중 step이 안 오르는 걸 정체로 보지 않게
                     took = save_checkpoint(cfg.training_mode, step, model, optimizer, cfg_hash, rank, ckpt_dir)
+                    metrics.checkpoint(step)
+                    metrics.stage("train")
                     last_saved = step
                     values["last_checkpoint_step"] = step
                     if rank == 0:
                         print(f"step {step}: saved {step_name(step)} in {took:.1f}s (loss {values['loss']:.4f})", flush=True)
                 progress.write(**values)
+                if prof is not None:
+                    prof.step()
+                mark = time.perf_counter()
                 if step >= total:
                     break
             epoch += 1
+        if prof is not None:
+            prof.stop()
+            prof = None
+        metrics.stage("finalize")
 
         # 마지막 저장이 승인돼야 재개 가능한 상태로 끝난다 (JobSet 템플릿 7절: 최대 120초)
         if not wait_approved(ckpt_dir, last_saved, APPROVAL_WAIT_SECONDS):
@@ -485,6 +606,8 @@ def main():
         progress.write(status="FAILED")
         raise
     finally:
+        if prof is not None:
+            prof.stop()
         if dist.is_initialized():
             dist.destroy_process_group()
 
