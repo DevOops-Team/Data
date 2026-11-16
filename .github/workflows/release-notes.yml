@@ -1,0 +1,18 @@
+# develop → main PR 본문의 '## 릴리스 노트' 형식 검사 + 다음 버전 미리보기 (GPU-136).
+#   본문을 고치면(edited) 다시 돈다. main 필수 상태 검사: "release-notes / release notes".
+name: release notes
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-notes:
+    uses: DevOops-Team/Gitops/.github/workflows/release-plan.yml@main
+    permissions:
+      contents: read
+      pull-requests: read
