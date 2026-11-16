@@ -11,7 +11,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
 
-RUN pip install "transformers==4.46.3" "safetensors==0.4.5" "sentencepiece==0.2.0" "tokenizers==0.20.3"
+RUN pip install "transformers==4.46.3" "safetensors==0.4.5" "sentencepiece==0.2.0" "tokenizers==0.20.3" \
+    "prometheus_client==0.21.1"
+# train.py가 rank마다 :8000/metrics로 학습 지표를 연다 (GPU-96, Monitoring docs/training-metrics.md)
+EXPOSE 8000
 
 WORKDIR /opt/train
 

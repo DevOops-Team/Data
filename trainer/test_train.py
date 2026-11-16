@@ -138,5 +138,62 @@ class Resume(unittest.TestCase):
         self.assertEqual(train.resume_position(300, 100), (3, 0))
 
 
+class MetricsHelpers(unittest.TestCase):
+    """학습 지표 (GPU-96, Monitoring docs/training-metrics.md)."""
+
+    def test_labels_come_from_job_env(self):
+        env = {"JOB_ID": "3f9a1c2e", "GENERATION": "2", "JOB_COMPLETION_INDEX": "3", "RANK": "3"}
+        self.assertEqual(train.metric_labels(env), {"job_id": "3f9a1c2e", "generation": "2", "rank": "3"})
+
+    def test_phase_is_warmup_until_warmup_steps(self):
+        self.assertEqual(train.phase_of(100, 100), "warmup")
+        self.assertEqual(train.phase_of(101, 100), "steady")
+
+    def test_nccl_kernels_count_as_comm(self):
+        class E:
+            def __init__(self, name, us):
+                self.name, self.self_device_time_total = name, us
+        events = [E("ampere_sgemm_128x64", 600_000), E("ncclDevKernel_AllGather_RING_LL", 300_000), E("elementwise", 20_000)]
+        self.assertEqual(train.split_kernel_seconds(events), (0.62, 0.3))
+
+    def test_metrics_off_is_a_no_op(self):
+        m = train.Metrics({"job_id": "j", "generation": "1", "rank": "0"}, port=0)
+        self.assertFalse(m.on)
+        m.stage("train"); m.step(1, 2.0, 0.5, 0.01, "warmup"); m.checkpoint(1); m.kernels([])  # noqa: E702
+
+
+try:
+    import prometheus_client  # noqa: F401
+    HAVE_PROM = True
+except ImportError:
+    HAVE_PROM = False
+
+
+@unittest.skipUnless(HAVE_PROM, "prometheus_client 없음 (trainer 이미지에는 있음)")
+class MetricsExport(unittest.TestCase):
+    def test_all_eight_metrics_are_exposed(self):
+        import socket
+        import urllib.request
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        m = train.Metrics({"job_id": "3f9a1c2e", "generation": "1", "rank": "0"}, port=port)
+        m.stage("checkpoint")
+        m.step(5, 2.5, 0.8, 0.02, "steady")
+        m.checkpoint(5)
+
+        class E:
+            name, self_device_time_total = "ncclKernel", 1000
+        m.kernels([E()])
+        body = urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5).read().decode()
+        for name in ("train_step_seconds_bucket", "train_data_wait_seconds_bucket", "train_rank_compute_seconds",
+                     "train_rank_comm_seconds", "train_current_step", "train_loss", "train_stage",
+                     "train_last_checkpoint_step"):
+            self.assertIn(name, body)
+        self.assertIn('train_stage{generation="1",job_id="3f9a1c2e",rank="0",stage="checkpoint"} 1.0', body)
+        self.assertIn('train_step_seconds_bucket{generation="1",job_id="3f9a1c2e",le="1.0",phase="steady",rank="0"} 1.0', body)
+
+
 if __name__ == "__main__":
     unittest.main()
