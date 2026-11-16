@@ -104,5 +104,39 @@ class Helpers(unittest.TestCase):
             self.assertFalse(train.wait_approved(d, 20, 0))
 
 
+class Resume(unittest.TestCase):
+    """ckpt-init이 남기는 resume.json (checkpoint/ckpt/init_main.py _write_resume) 읽기."""
+
+    def write(self, d, body):
+        with open(os.path.join(d, "resume.json"), "w") as f:
+            json.dump(body, f)
+
+    def test_no_resume_file_means_start_from_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(train.read_resume(d), (0, None))
+
+    def test_fresh_start_written_by_init(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"resume": False, "approved_gen": None, "approved_step": None, "step_dir": None, "start_step": 1})
+            self.assertEqual(train.read_resume(d), (0, None))
+
+    def test_resume_returns_the_approved_step_and_folder(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "step-00001200"))
+            self.write(d, {"resume": True, "approved_gen": 1, "approved_step": 1200, "step_dir": "step-00001200", "start_step": 1201})
+            self.assertEqual(train.read_resume(d), (1200, os.path.join(d, "step-00001200")))
+
+    def test_resume_without_the_folder_fails_instead_of_starting_over(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, {"resume": True, "approved_gen": 1, "approved_step": 1200, "step_dir": "step-00001200", "start_step": 1201})
+            with self.assertRaises(SystemExit):
+                train.read_resume(d)
+
+    def test_resume_position_skips_batches_already_done_in_that_epoch(self):
+        self.assertEqual(train.resume_position(0, 100), (0, 0))
+        self.assertEqual(train.resume_position(250, 100), (2, 50))
+        self.assertEqual(train.resume_position(300, 100), (3, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
