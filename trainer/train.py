@@ -5,7 +5,9 @@
   - TRAIN_CONFIG(/code/config.json)을 읽고 CONFIG_SHA256 · 키 · world_size를 확인한다.
   - ckpt-init이 받아 둔 업로드: 모델 폴더 DATA_DIR/model, 학습 데이터 DATA_DIR/data/*.jsonl ({"text": ...}).
   - 어떤 HF 모델이든 AutoModelForCausalLM으로 읽는다. FSDP는 모델의 _no_split_modules(트랜스포머 블록) 단위로 감싼다.
-  - rank 0이 매 step PROGRESS_FILE에 상태를 쓰면 progress-reporter가 DynamoDB로 옮긴다.
+  - rank 0이 매 step PROGRESS_FILE에 상태를 쓰면 ckpt-sidecar가 Kafka job.progress로 보낸다 (GPU-141).
+  - 재개: ckpt-init이 승인본을 CKPT_DIR/step-N/에 받고 CKPT_DIR/resume.json을 남기면, 그 step의 모델 · 옵티마이저를
+    불러와 step N 다음부터 같은 데이터 순서로 이어 간다 (같은 seed · set_epoch, 그 epoch에서 이미 한 배치는 건너뜀).
 
 체크포인트 (설계 5절 · JobSet 템플릿 7절):
   - 간격: config의 checkpoint_policy.interval_seconds(τ, Young/Daly)를 처음 warmup_measure_steps step의
@@ -185,8 +187,33 @@ def read_tokens(paths, tokenizer):
     return ids
 
 
+def read_resume(ckpt_dir: str) -> tuple[int, str | None]:
+    """ckpt-init이 남긴 resume.json → (이어 갈 승인 step, 그 step 폴더). 승인본이 없으면 (0, None).
+
+    resume.json이 아예 없으면 ckpt-init 없이 띄운 경우라 처음부터 한다.
+    """
+    path = os.path.join(ckpt_dir, "resume.json")
+    if not os.path.exists(path):
+        return 0, None
+    with open(path) as f:
+        info = json.load(f)
+    if not info.get("resume"):
+        return 0, None
+    step = int(info["approved_step"])
+    step_dir = os.path.join(ckpt_dir, info.get("step_dir") or step_name(step))
+    if not os.path.isdir(step_dir):
+        raise SystemExit(f"resume.json says {step_name(step)} but {step_dir} is missing")
+    return step, step_dir
+
+
+def resume_position(step: int, steps_per_epoch: int) -> tuple[int, int]:
+    """step개를 마친 뒤의 데이터 위치 → (epoch, 그 epoch에서 건너뛸 배치 수)."""
+    return step // steps_per_epoch, step % steps_per_epoch
+
+
 def save_fsdp(step, model, optimizer, cfg_hash, step_dir):
     # 모든 rank가 자기 조각을 쓴다. 모델 상태가 GPU마다 다르기 때문이다.
+    # (torch 2.5.1의 get_state_dict는 조각이 0개인 rank가 있으면 실패해서 FSDP 자체 API를 쓴다)
     import torch.distributed.checkpoint as dcp
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from torch.distributed.fsdp import StateDictType
@@ -194,11 +221,72 @@ def save_fsdp(step, model, optimizer, cfg_hash, step_dir):
     with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
         state = {
             "model": model.state_dict(),
-            "optim": FSDP.optim_state_dict(model, optimizer),
+            # 옵티마이저는 Adam 모멘트(state)만. param_groups(lr · betas · weight_decay)는 코드 · 스케줄이 정하고,
+            # 텐서 없는 목록이라 DCP가 저장 · 불러오기 때 키를 다르게 펼쳐 불러오기가 실패한다
+            "optim": {"state": FSDP.optim_state_dict(model, optimizer)["state"]},
             "step": step,
             "config_sha256": cfg_hash,
         }
     dcp.save(state, checkpoint_id=step_dir)
+
+
+def init_optimizer_state(optimizer) -> None:
+    """학습 전 옵티마이저는 상태(Adam exp_avg · exp_avg_sq · step)가 비어 있다. 비어 있으면 불러올 칸이 없어서
+    저장된 상태가 안 들어간다 → 학습률 0 · 기울기 0으로 한 번 step해 칸만 만든다 (가중치는 안 바뀜)."""
+    import torch
+
+    if optimizer.state:
+        return
+    lrs = [g["lr"] for g in optimizer.param_groups]
+    for g in optimizer.param_groups:
+        g["lr"] = 0.0
+        for p in g["params"]:
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+    optimizer.step()
+    for g, lr in zip(optimizer.param_groups, lrs):
+        g["lr"] = lr
+    optimizer.zero_grad(set_to_none=True)
+
+
+def load_fsdp(model, optimizer, step_dir) -> tuple[int, str]:
+    # 저장과 같은 모양의 빈 state를 만들고 DCP가 내 조각을 채운다.
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import StateDictType
+
+    init_optimizer_state(optimizer)
+    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+        current = FSDP.optim_state_dict(model, optimizer)
+        state = {"model": model.state_dict(), "optim": {"state": current["state"]},
+                 "step": 0, "config_sha256": ""}
+        dcp.load(state, checkpoint_id=step_dir)
+        model.load_state_dict(state["model"])
+        osd = {"state": state["optim"]["state"], "param_groups": current["param_groups"]}
+        optimizer.load_state_dict(FSDP.optim_state_dict_to_load(model, optimizer, osd))
+    return int(state["step"]), str(state["config_sha256"])
+
+
+def load_ddp(model, optimizer, step_dir, device) -> tuple[int, str]:
+    # rank 0이 쓴 파일 하나를 모든 rank가 읽는다 (ckpt-init이 manifest의 파일을 Pod마다 다 받아 둔다).
+    import torch
+
+    state = torch.load(os.path.join(step_dir, "checkpoint.pt"), map_location=device, weights_only=False)
+    model.module.load_state_dict(state["model"])
+    optimizer.load_state_dict(state["optim"])
+    return int(state["step"]), str(state["config_sha256"])
+
+
+def load_checkpoint(mode, model, optimizer, step_dir, device, want_step, cfg_hash) -> None:
+    """승인본을 불러오고, 안에 적힌 step · 설정 해시가 맞는지 확인한다."""
+    if mode == "fsdp":
+        step, sha = load_fsdp(model, optimizer, step_dir)
+    else:
+        step, sha = load_ddp(model, optimizer, step_dir, device)
+    if step != want_step:
+        raise SystemExit(f"{step_dir} holds step {step}, resume.json says {want_step}")
+    if sha and sha != cfg_hash:
+        raise SystemExit(f"checkpoint config {sha} != current config {cfg_hash}")
 
 
 def save_ddp(step, model, optimizer, cfg_hash, step_dir, rank):
@@ -318,20 +406,31 @@ def main():
         model.train()
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0.1)
 
+        # 재개: ckpt-init이 받아 둔 승인본에서 이어 간다 (없으면 처음부터)
+        start, resume_dir = read_resume(ckpt_dir)
+        if start:
+            load_checkpoint(cfg.training_mode, model, optimizer, resume_dir, device, start, cfg_hash)
+            progress.write(step=start, last_checkpoint_step=start)
+            if rank == 0:
+                print(f"resumed from {step_name(start)}", flush=True)
+        epoch, skip = resume_position(start, steps_per_epoch)
+
         policy = cfg.checkpoint_policy
-        measure = max(1, min(policy.warmup_measure_steps, total))
+        measure_until = min(start + max(1, policy.warmup_measure_steps), total)
         every = None  # 측정이 끝나기 전에는 저장하지 않는다 (마지막 step 제외)
         measure_start = None
-        step = 0
-        epoch = 0
-        last_saved = 0
+        step = start
+        last_saved = start
         while step < total:
             sampler.set_epoch(epoch)
             for (batch,) in loader:
+                if skip:  # 재개한 epoch에서 이미 학습한 배치 (같은 seed · epoch라 순서가 같다)
+                    skip -= 1
+                    continue
                 if stop_requested(ckpt_dir):
                     print(f"rank {rank}: STOP at step {step}", flush=True)
                     sys.exit(STOP_EXIT)
-                if step == 1:  # 첫 step(CUDA 초기화 · 컴파일)은 재지 않는다
+                if step == start + 1:  # 첫 step(CUDA 초기화 · 컴파일)은 재지 않는다
                     torch.cuda.synchronize()
                     measure_start = time.perf_counter()
                 step += 1
@@ -348,9 +447,9 @@ def main():
                 dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
                 values = {"step": step, "loss": float(reduced.item()) / world}
 
-                if every is None and step >= measure and measure_start is not None:
+                if every is None and step >= measure_until and measure_start is not None:
                     torch.cuda.synchronize()
-                    elapsed = torch.tensor([(time.perf_counter() - measure_start) / max(1, step - 1)], device=device)
+                    elapsed = torch.tensor([(time.perf_counter() - measure_start) / max(1, step - start - 1)], device=device)
                     dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)  # 모든 rank가 같은 간격을 쓴다
                     step_seconds = float(elapsed.item())
                     every, count = checkpoint_every(total, step_seconds, policy.interval_seconds)
