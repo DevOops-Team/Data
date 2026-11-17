@@ -11,6 +11,9 @@
 0 정상 · 2 세대 불일치 · 3 owner 선점 실패 · 4 연결 오류로 다운로드 실패(재시도 · 제한 시간 초과, 다시 띄우면 될 수 있음)
 5 승인본이 현재 작업과 맞지 않음 · 6 항목 없음 · 7 승인본 손상(체크섬 · 크기 불일치, 파일 없음 — 같은 승인본으로는 안 됨)
 
+실패하면 /dev/termination-log(env TERMINATION_LOG)에 JSON 한 줄: exit_code · reason · job_id · generation · cluster ·
+checkpoint_gen · checkpoint_step · detail → Pod 상태 terminated.message (GPU-120)
+
 재시도: 일시 오류는 3회(5 → 10 → 20초), 다운로드 전체 제한 DOWNLOAD_DEADLINE_S(기본 600초).
 복구 컨트롤러의 '복원 · 학습 진행 확인 30분' 안에 끝나도록 한다.
 """
@@ -32,6 +35,31 @@ from .storage import Store, sha256_file
 EXIT_OK, EXIT_GEN, EXIT_OWNER, EXIT_DOWNLOAD, EXIT_MISMATCH, EXIT_NO_ITEM, EXIT_CORRUPT = 0, 2, 3, 4, 5, 6, 7
 
 
+# 마지막 실패 (main이 TERMINATION_LOG에 씀). run()이 시작할 때 비운다
+FAILURE: dict = {}
+TERMINATION_LIMIT = 4096  # 쿠버네티스 terminationMessage 한도 (바이트)
+
+
+def _fail(code: int, reason: str, **detail) -> int:
+    """실패를 로그와 FAILURE에 남기고 종료 코드를 돌려준다 (GPU-120 termination-log)."""
+    log(reason, **detail)
+    FAILURE.update(exit_code=code, reason=reason.removeprefix("init."), detail=detail)
+    return code
+
+
+def termination_message(cfg: Config, code: int) -> str:
+    """복구 컨트롤러가 Pod 상태(terminated.message)에서 읽는 실패 정보 JSON 한 줄 (4KB 이하)."""
+    body = {"exit_code": code, "reason": FAILURE.get("reason", "unknown"), "job_id": cfg.job_id,
+            "generation": cfg.generation, "cluster": cfg.cluster,
+            "checkpoint_gen": FAILURE.get("checkpoint_gen"), "checkpoint_step": FAILURE.get("checkpoint_step"),
+            "detail": FAILURE.get("detail", {})}
+    text = json.dumps(body, ensure_ascii=False, default=str)
+    if len(text.encode()) > TERMINATION_LIMIT:  # 긴 오류 문구는 detail만 줄인다
+        body["detail"] = {k: str(v)[:200] for k, v in body["detail"].items()}
+        text = json.dumps(body, ensure_ascii=False, default=str)[:TERMINATION_LIMIT]
+    return text
+
+
 def _s3_key(uri: str) -> tuple[str, str]:
     u = urlparse(uri)
     return u.netloc, u.path.lstrip("/")
@@ -40,29 +68,27 @@ def _s3_key(uri: str) -> tuple[str, str]:
 def run(cfg: Config, fencing: FencingTable, store: Store, policy: RetryPolicy | None = None) -> int:
     policy = policy or RetryPolicy(deadline_s=float(os.environ.get("DOWNLOAD_DEADLINE_S", "600")))
     policy.started()
+    FAILURE.clear()
     try:
         item = policy.call(lambda: fencing.get(cfg.job_id))
     except Exception as e:  # noqa: BLE001
-        log("init.ddb_unreachable", error=repr(e))
-        return EXIT_DOWNLOAD
+        return _fail(EXIT_DOWNLOAD, "init.ddb_unreachable", error=repr(e))
     if item is None:
-        log("init.no_item", job_id=cfg.job_id)
-        return EXIT_NO_ITEM
+        return _fail(EXIT_NO_ITEM, "init.no_item", job_id=cfg.job_id)
+    FAILURE.update(checkpoint_gen=item.approved_gen, checkpoint_step=item.approved_step, ddb_generation=item.generation)
 
     # 1. 세대 확인
     if item.generation != cfg.generation:
-        log("init.generation_mismatch", env_gen=cfg.generation, ddb_gen=item.generation)
-        return EXIT_GEN
+        return _fail(EXIT_GEN, "init.generation_mismatch", env_gen=cfg.generation, ddb_gen=item.generation)
 
     # 2. owner 선점 (조건 실패는 재시도하지 않음, 연결 오류만 재시도)
     try:
         claimed = policy.call(lambda: fencing.claim_owner(cfg.job_id, cfg.generation, cfg.cluster))
     except Exception as e:  # noqa: BLE001
-        log("init.ddb_unreachable", error=repr(e))
-        return EXIT_DOWNLOAD
+        return _fail(EXIT_DOWNLOAD, "init.ddb_unreachable", error=repr(e))
     if not claimed:
-        log("init.owner_claim_failed", cluster=cfg.cluster, owner=(fencing.get(cfg.job_id) or item).owner)
-        return EXIT_OWNER
+        return _fail(EXIT_OWNER, "init.owner_claim_failed", cluster=cfg.cluster,
+                     owner=(fencing.get(cfg.job_id) or item).owner)
     log("init.owner_claimed", cluster=cfg.cluster, gen=cfg.generation)
 
     try:
@@ -104,19 +130,16 @@ def run(cfg: Config, fencing: FencingTable, store: Store, policy: RetryPolicy | 
         step_dir = layout.local_step_dir(cfg.ckpt_dir, step)
         manifest = store.download_checkpoint(cfg.job_id, gen, step, step_dir, policy)
     except CorruptError as e:
-        log("init.corrupt", error=str(e))          # 같은 승인본으로는 안 됨 → 복구 컨트롤러가 prev_approved 등 판단
-        return EXIT_CORRUPT
+        # 같은 승인본으로는 안 됨 → 복구 컨트롤러가 prev_approved 등 판단
+        return _fail(EXIT_CORRUPT, "init.corrupt", error=str(e))
     except Exception as e:  # noqa: BLE001 — 그 밖의 실패도 시작하지 않고 보고
-        log("init.download_failed", error=repr(e), transient=is_transient(e))
-        return EXIT_DOWNLOAD
+        return _fail(EXIT_DOWNLOAD, "init.download_failed", error=repr(e), transient=is_transient(e))
 
     # 승인본이 지금 작업과 맞는지 (규약 7절 3번)
     if cfg.config_sha256 and manifest.get("config_sha256") and manifest["config_sha256"] != cfg.config_sha256:
-        log("init.config_mismatch", manifest=manifest["config_sha256"], env=cfg.config_sha256)
-        return EXIT_MISMATCH
+        return _fail(EXIT_MISMATCH, "init.config_mismatch", manifest=manifest["config_sha256"], env=cfg.config_sha256)
     if manifest.get("world_size") != cfg.world_size:
-        log("init.world_size_mismatch", manifest=manifest.get("world_size"), env=cfg.world_size)
-        return EXIT_MISMATCH
+        return _fail(EXIT_MISMATCH, "init.world_size_mismatch", manifest=manifest.get("world_size"), env=cfg.world_size)
 
     layout.done_marker(cfg.ckpt_dir, step).touch()
     layout.approved_marker(cfg.ckpt_dir, step).touch()
@@ -135,7 +158,13 @@ def _write_resume(ckpt_dir: Path, gen: int | None, step: int | None) -> None:
 
 def main() -> None:
     cfg = Config.from_env()
-    sys.exit(run(cfg, FencingTable(cfg.table, region=cfg.region), Store(cfg.bucket, region=cfg.region)))
+    code = run(cfg, FencingTable(cfg.table, region=cfg.region), Store(cfg.bucket, region=cfg.region))
+    if code != EXIT_OK:  # Pod 상태 terminated.message로 실패 이유 · 세대 · 승인 step 전달 (GPU-120)
+        try:
+            Path(os.environ.get("TERMINATION_LOG", "/dev/termination-log")).write_text(termination_message(cfg, code))
+        except OSError as e:
+            log("init.termination_log_failed", error=repr(e))
+    sys.exit(code)
 
 
 if __name__ == "__main__":
