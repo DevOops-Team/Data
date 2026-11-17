@@ -22,6 +22,44 @@ python submit.py experiments/scenarios/demo-single.csv --exp-id exp-a-ours-xid79
 
 장애 주입 시점은 파일에 넣지 않는다. 실험 절차: 제출 → 첫 `checkpoint.approved` 확인 → 정해진 시간 뒤 주입 → 복구 · 재개 → 완료 → `experiment.ended`.
 
+## 작업 1개 손으로 제출 — `submit_job.py` (GPU-119)
+
+투입기 없이 같은 조건의 작업 하나를 반복해서 낼 때 쓴다 (E2E 장애 시험, 측정 확인). Backend `POST /api/jobs`로 낸다.
+
+```bash
+python experiments/submit_job.py --model-dir ~/models/gpt2 --name e2e-fault-2 --steps 1500 --exp-id e2e-1117
+```
+
+| 인자 | 기본값 | 뜻 |
+|---|---|---|
+| `--model-dir` | (필수) | Hugging Face 모델 폴더. 받는 방법은 스크립트 맨 위 주석 |
+| `--steps` | 1500 | `max_steps`. gpt2 · FSDP 2장은 step당 약 1.32초 → 1500이면 학습 약 34분 |
+| `--gpus` · `--strategy` · `--batch` | 2 · fsdp · 4 | GPU 수 · 방식 · GPU당 배치 |
+| `--exp-id` | 없음 | 실험 ID. 측정 때 `--exp`로 묶는다 |
+| `--dry-run` | | 데이터만 만들고 spec 출력 |
+
+- **학습 데이터는 스크립트가 만든다.** train.py는 토큰을 1024개씩 묶어 샘플 하나로 쓰므로, `steps × gpus × batch × 1024` 토큰(+30%)이 되게 줄 수를 정한다. 같은 인자면 같은 파일 (1500 · 2 · 4 → 약 16만 줄, 100MB).
+- **train.py는 이 레포 `trainer/train.py`를 올린다.** 학습 이미지에는 train.py가 없고 사용자 업로드를 쓴다 (재개 · 진행률 · 지표가 들어 있는 최신본이어야 장애 뒤 이어서 학습함).
+- **저장 간격은 Backend가 정한다** (지금 845초). 첫 승인이 학습 시작 후 약 14분이라 장애는 그 뒤에 넣는다.
+
+### 장애 시험 순서 (11/17 1차 기록: Jira GPU-119)
+
+1. 제출 → DB에서 `job.started` · 첫 `checkpoint.approved` 확인
+2. 학습 노드 찾기: EKS API는 비공개라 맥에서 kubectl이 안 된다 → EC2 CloudWatch `CPUUtilization` · `NetworkOut`이 높은 학습 노드 2대가 그 작업 (FSDP는 두 노드가 계속 통신)
+3. 장애 주입: 그 노드 `aws ec2 terminate-instances` (노드 그룹이 새 노드로 교체)
+4. 확인: `job.failed` → 복구 컨트롤러 펜싱(`recovery_id`, 세대 +1) → 세대 2 `job.started` · 첫 진행률이 승인 step + 1부터
+5. 측정: `python -m collector.measure --exp e2e-1117 --create-exp "11/17 E2E"`
+
+11/17 1차: 감지(`job.failed`)까지 2분 11초. 복구는 분류기(`gpu.fault` 생산)와 복구 컨트롤러 실행 모드가 아직 없어서 시작 안 됨 → 완성 후 다시.
+
+### 실험 ↔ 작업 연결 (`exp_id`)
+
+| 경우 | 연결되는 방법 |
+|---|---|
+| 투입기로 제출 | 투입기가 `experiment.started`(실험 행)를 먼저 내고 제출에 `exp_id`를 실음 → 수집기가 `job_runs.exp_id`를 채움. 제출이 먼저 와도 `experiment.started`가 오면 나중에 채움 |
+| `submit_job.py --exp-id`로 제출 | `experiment.started`가 없어 실험 행이 없음 → 수집기는 `job_runs.exp_id`를 비워 둠. 측정 때 `--create-exp`가 실험 행을 만들고, 제출 사건의 `exp_id`로 세대 1 · 2 줄을 모두 채움 (`linked_job_runs`에 개수) |
+| `exp_id` 없이 제출 | 측정 때 `--jobs ID,...` 또는 `--since` · `--until`로 고름 |
+
 ## 실험 표
 
 변수: 정책(`ours` · `naive` 자동 재시작만 · `hyperpod` 흉내 · `manual`), 장애 종류(필수: 노드 하드웨어 `xid79` · 소프트웨어 오류 `sw_error` · 스팟 회수 `spot`, 목표: AZ 장애 `az` · 스트래글러 `straggler`), 예비 GPU on/off, 저장 주기.
@@ -60,7 +98,7 @@ Backend는 Young–Daly 공식으로 간격을 정한다: √(2 × 저장 시간
 
 ## 확인 필요
 
-- **실험 ↔ 작업 연결**: 수집기는 `job.submitted` payload의 `exp_id`로 `job_runs.exp_id`를 채운다. 투입기는 Backend `POST /api/jobs`로 제출하는데 이 API가 `exp_id`를 받지 않아 지금은 연결이 비어 있다 → 투입기가 `exp_id`를 넘기고 Backend가 `job.submitted` payload · JobSet 주석 `devoops/exp-id`에 넣어야 함 (김성모 · 노찬경)
+- ~~실험 ↔ 작업 연결~~: 해결 (11/17). Backend `POST /api/jobs`가 `exp_id`를 받아 `job.submitted` payload · JobSet 주석 `devoops/exp-id`에 넣는다 (GPU-172). 연결 방법은 위 "실험 ↔ 작업 연결"
 - `exp_id` 매기기: 투입기 `--exp-id`, 행은 수집기가 `experiment.started`로 만든다 (투입기 README의 질문에 대한 답)
 - step 수를 Backend에 넘길 칸 (투입기 README "아직 정할 것")
 - 스팟 회수 실험(`spot`)의 마지막 저장은 ADR-28 · GPU-120 확정 뒤

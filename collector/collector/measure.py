@@ -2,7 +2,8 @@
 
 데이터 DB 표 주인(data_app)으로 실행한다 (data_collector는 results 권한 없음). 같은 입력이면 같은 값 (다시 돌려도 덮어씀).
 
-  python -m collector.measure --exp e2e-1117                       # job_runs.exp_id = e2e-1117인 작업
+  python -m collector.measure --exp e2e-1117                       # job_runs.exp_id 또는 제출 사건 exp_id = e2e-1117인 작업
+  python -m collector.measure --exp e2e-1117 --create-exp "11/17 E2E"   # 투입기 없이 exp_id만 붙여 제출한 경우 (실험 행 만들고 연결)
   python -m collector.measure --exp e2e-1117 --jobs 0cb3b0c3,3989c020 --create-exp "11/17 E2E"   # exp_id 연결 전
   python -m collector.measure --exp e2e-1117 --since 2026-11-17T09:00+09:00 --until 2026-11-17T18:00+09:00 --create-exp "11/17"
   ... --dry-run                                                    # 계산만, 쓰지 않음
@@ -109,8 +110,27 @@ def select_jobs(cur, exp_id: str, jobs: list[str] | None, since: str | None, unt
             "SELECT job_id FROM data.job_runs GROUP BY job_id HAVING min(submitted_at) >= COALESCE(%s::timestamptz, '-infinity') "
             "AND min(submitted_at) < COALESCE(%s::timestamptz, 'infinity') ORDER BY min(submitted_at)", (since, until)).fetchall()
     else:
-        rows = cur.execute("SELECT DISTINCT job_id FROM data.job_runs WHERE exp_id = %s ORDER BY 1", (exp_id,)).fetchall()
+        # job_runs.exp_id가 아직 비어 있어도(실험 행보다 제출이 먼저) 제출 사건의 exp_id로 찾는다
+        rows = cur.execute(
+            """SELECT job_id FROM data.job_runs WHERE exp_id = %s
+               UNION SELECT job_id FROM data.events WHERE type = 'job.submitted' AND payload->>'exp_id' = %s
+               ORDER BY 1""", (exp_id, exp_id)).fetchall()
     return [r[0] for r in rows]
+
+
+def link_jobs(cur, exp_id: str) -> int:
+    """제출 사건에 exp_id가 있는데 job_runs.exp_id가 빈 작업을 실험에 연결한다.
+
+    수집기는 job.submitted를 받을 때 실험 행이 없으면 exp_id를 비워 두고, experiment.started가 오면 채운다
+    (collector/store.py). 투입기 없이 제출하고 measure --create-exp로 실험 행을 만든 경우는 experiment.started가
+    없어서 여기서 같은 방식으로 채운다. 세대 2 이후 줄도 같은 작업이면 같이 채운다.
+    """
+    cur.execute(
+        """UPDATE data.job_runs jr SET exp_id = %s
+           FROM data.events ev
+           WHERE ev.type = 'job.submitted' AND ev.payload->>'exp_id' = %s
+             AND jr.job_id = ev.job_id AND jr.exp_id IS NULL""", (exp_id, exp_id))
+    return cur.rowcount
 
 
 def summary(results: list[JobResult]) -> dict:
@@ -155,11 +175,12 @@ def run(conn, exp_id: str, *, jobs=None, since=None, until=None, create_exp=None
             if not dry_run:
                 cur.execute("INSERT INTO data.experiments (exp_id, name, scenario, policy, spare_enabled, note) "
                             "VALUES (%s,%s,%s,%s,true,%s)", (exp_id, create_exp, scenario, policy, "measure --create-exp"))
+        linked = link_jobs(cur, exp_id) if not dry_run else 0
         ids = select_jobs(cur, exp_id, jobs, since, until)
         results = [r for r in (compute_job(cur, j) for j in ids) if r is not None]
         if not dry_run:
             write(cur, exp_id, results)
-    return {"exp_id": exp_id, "calc_version": CALC_VERSION, "dry_run": dry_run,
+    return {"exp_id": exp_id, "calc_version": CALC_VERSION, "dry_run": dry_run, "linked_job_runs": linked,
             "summary": summary(results), "jobs": [asdict(r) for r in results]}
 
 
