@@ -130,7 +130,29 @@ def test_corrupted_checkpoint_blocks_start(names, fencing, store, tmp_path):
     c2 = Config(**{**c.__dict__, "generation": 2, "ckpt_dir": tmp_path / "p2" / "ckpt"})
     assert init_run(c2, fencing, store) == EXIT_CORRUPT
     msg = json.loads(termination_message(c2, EXIT_CORRUPT))
-    assert (msg["exit_code"], msg["reason"], msg["checkpoint_step"]) == (7, "corrupt", 100)
+    assert (msg["exit_code"], msg["reason"], msg["checkpoint_gen"], msg["checkpoint_step"]) == (7, "corrupt", 1, 100)
+
+    # 같은 정보가 Kafka job.init_failed로 (사건은 전부 Kafka 기준, GPU-120)
+    pub = FakePublisher()
+    init_main.publish_failure(c2, EXIT_CORRUPT, pub)
+    [(topic, key, ev)] = pub.sent
+    assert (topic, key, ev["type"], ev["source"], ev["generation"], ev["cluster"]) == (
+        "job.lifecycle", JOB, "job.init_failed", "ckpt-init", 2, "eks-a")
+    assert ev["event_id"] == f"init-{JOB}-g0002-r0-corrupt"
+    assert {k: ev["payload"][k] for k in ("exit_code", "reason", "rank", "checkpoint_gen", "checkpoint_step")} == {
+        "exit_code": 7, "reason": "corrupt", "rank": 0, "checkpoint_gen": 1, "checkpoint_step": 100}
+    assert pub.flushed
+
+
+class FakePublisher:
+    def __init__(self):
+        self.sent, self.flushed = [], False
+
+    def publish(self, *, topic, key, value):
+        self.sent.append((topic, key, value))
+
+    def flush(self, timeout=5.0):
+        self.flushed = True
 
 
 def test_termination_message_fits_kubernetes_limit(names, tmp_path, monkeypatch):
@@ -145,11 +167,29 @@ def test_main_writes_termination_log_only_on_failure(names, fencing, tmp_path, m
     monkeypatch.setenv("TERMINATION_LOG", str(out))
     c = cfg(names, tmp_path, gen=1, rank=0, cluster="eks-a", pod="p")       # 펜싱 항목이 없음 → 6
     monkeypatch.setattr(init_main.Config, "from_env", classmethod(lambda cls: c))
+    pub = FakePublisher()
+    monkeypatch.setattr(init_main.events, "from_env", lambda **kw: pub)
     try:
         init_main.main()
     except SystemExit as e:
         assert e.code == 6
     assert json.loads(out.read_text())["reason"] == "no_item"
+    assert [ev["payload"]["reason"] for _, _, ev in pub.sent] == ["no_item"]
+
+
+def test_event_failure_does_not_change_exit_code(names, fencing, tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINATION_LOG", str(tmp_path / "termination-log"))
+    c = cfg(names, tmp_path, gen=1, rank=0, cluster="eks-a", pod="p")
+    monkeypatch.setattr(init_main.Config, "from_env", classmethod(lambda cls: c))
+
+    def boom(**kw):
+        raise RuntimeError("kafka down")
+    monkeypatch.setattr(init_main.events, "from_env", boom)
+    try:
+        init_main.main()
+    except SystemExit as e:
+        assert e.code == 6                                                   # 발행 실패와 상관없이 원래 코드
+    assert json.loads((tmp_path / "termination-log").read_text())["reason"] == "no_item"
 
 
 def test_missing_rank_is_not_approved(names, fencing, store, tmp_path):
