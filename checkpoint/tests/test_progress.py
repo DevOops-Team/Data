@@ -95,6 +95,18 @@ def test_status_change_sent_immediately_with_distinct_id(setup):
                                                         "progress-3f9a1c2e-g0002-s00002080-completed"]
 
 
+def test_failure_reason_is_sent_with_failed_status(setup):
+    """GPU-188: train.py가 실패 때 쓰는 error 한 줄도 job.progress payload로 간다."""
+    path, pub, clock, rep = setup
+    write(path, step=40, loss=2.0)
+    rep.tick()
+    clock.t += 1
+    write(path, step=40, loss=2.0, status="FAILED", error="ValueError: bad batch")
+    assert rep.tick() is True
+    ev = pub.sent[-1][2]
+    assert ev["event_id"].endswith("-failed") and ev["payload"]["error"] == "ValueError: bad batch"
+
+
 def test_force_sends_pending_on_shutdown(setup):
     path, pub, clock, rep = setup
     write(path, step=10, loss=3.2)

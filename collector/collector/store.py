@@ -116,9 +116,9 @@ def _job_progress(cur: Cursor, e: Event) -> None:
         raise DeriveSkip("job_id · generation 없음")
     cur.execute(
         """INSERT INTO data.job_progress (job_id, generation, status, step, total_steps, loss, last_checkpoint_step,
-                                          checkpoint_every_steps, step_seconds, cluster, event_id, updated_at)
+                                          checkpoint_every_steps, step_seconds, cluster, event_id, updated_at, error)
            VALUES (%(job)s, %(gen)s, %(status)s, %(step)s, %(total)s, %(loss)s, %(lck)s, %(every)s, %(sec)s,
-                   %(cluster)s, %(eid)s, %(at)s)
+                   %(cluster)s, %(eid)s, %(at)s, %(err)s)
            ON CONFLICT (job_id) DO UPDATE SET
              generation = EXCLUDED.generation, status = EXCLUDED.status, step = EXCLUDED.step,
              total_steps = COALESCE(EXCLUDED.total_steps, data.job_progress.total_steps),
@@ -127,13 +127,15 @@ def _job_progress(cur: Cursor, e: Event) -> None:
              checkpoint_every_steps = COALESCE(EXCLUDED.checkpoint_every_steps, data.job_progress.checkpoint_every_steps),
              step_seconds = COALESCE(EXCLUDED.step_seconds, data.job_progress.step_seconds),
              cluster = COALESCE(EXCLUDED.cluster, data.job_progress.cluster),
-             event_id = EXCLUDED.event_id, updated_at = EXCLUDED.updated_at
+             event_id = EXCLUDED.event_id, updated_at = EXCLUDED.updated_at,
+             error = EXCLUDED.error                       -- 최신 사건 기준 (새 세대 · 정상 진행이면 비워짐)
            WHERE (EXCLUDED.generation, EXCLUDED.updated_at, EXCLUDED.step)
                  >= (data.job_progress.generation, data.job_progress.updated_at, data.job_progress.step)""",
         {"job": e.job_id, "gen": e.generation, "status": p.get("status"), "step": int(p["step"]),
          "total": p.get("total_steps"), "loss": p.get("loss"), "lck": p.get("last_checkpoint_step"),
          "every": p.get("checkpoint_every_steps"), "sec": p.get("step_seconds"),
-         "cluster": e.cluster or p.get("cluster"), "eid": e.event_id, "at": e.occurred_at},
+         "cluster": e.cluster or p.get("cluster"), "eid": e.event_id, "at": e.occurred_at,
+         "err": (str(p["error"])[:500] if p.get("error") else None)},
     )
 
 

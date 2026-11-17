@@ -29,7 +29,7 @@ Kafka 토픽의 사건을 읽어 PostgreSQL `gpuf_data`의 `data` 스키마(`db/
 | `job.started` · `job.resumed` · `job.completed` · `job.failed` · `job.fenced` · `job.stopped` · `job.cancelled` | 봉투 `job_id`·`generation` | |
 | `job.progress` | 봉투 `job_id`·`generation` + `step` | `status`, `total_steps`, `loss`, `last_checkpoint_step`, `checkpoint_every_steps`, `step_seconds` (빠진 칸은 이전 값 유지, 더 새로운 세대·시각일 때만 덮어씀) |
 
-화면용 뷰 `data.v_job_status` (`db/003_job_progress.sql`): 작업마다 최신 세대 1행 + `state`(PENDING · RUNNING · COMPLETED · FAILED · FENCED · STOPPED) · `recovery_count` · 진행률 · 마지막 **승인** 체크포인트(`last_approved_step`).
+화면용 뷰 `data.v_job_status` (`db/003_job_progress.sql`): 작업마다 최신 세대 1행 + `state`(PENDING · RUNNING · COMPLETED · FAILED · FENCED · STOPPED) · `recovery_count` · 진행률 · 마지막 **승인** 체크포인트(`last_approved_step`). 학습 실패 이유 한 줄은 `progress_error` (`db/005_progress_error.sql`, GPU-188).
 
 ## 환경 변수
 
@@ -48,7 +48,7 @@ Kafka 토픽의 사건을 읽어 PostgreSQL `gpuf_data`의 `data` 스키마(`db/
 | `postgres_exporter` | `pg_monitor` (통계 읽기만), 데이터 테이블 접근 없음, 연결 3개까지 | 모니터링 (ADR-18) |
 | `backend_ro` (`db/004_backend_role.sql`) | `v_job_status` · `job_runs` · `job_progress` · `checkpoints` 읽기만. `events` 등 사건 원본 · 쓰기 없음. `statement_timeout` 5s, 연결 10개까지 | Backend 화면 (GPU-141) |
 
-적용 순서: `001_init.sql`(data_app) → `002_roles.sql`(postgres) → `003_job_progress.sql`(data_app) → `004_backend_role.sql`(postgres) → `\password backend_ro`.
+적용 순서: `001_init.sql`(data_app) → `002_roles.sql`(postgres) → `003_job_progress.sql`(data_app) → `004_backend_role.sql`(postgres) → `\password backend_ro` → `005_progress_error.sql`(data_app). 005 뒤에는 003을 다시 돌리지 않는다 (뷰 칸 수가 달라 교체 거부).
 
 슈퍼유저로 실행한 뒤 `\password data_collector`, `\password postgres_exporter`로 비밀번호를 지정하고, `pg_hba.conf`에 필요한 주소만 허용한다.
 | `BATCH_SIZE` · `POLL_TIMEOUT_S` · `RETRY_SLEEP_S` | `500` · `1.0` · `5` |

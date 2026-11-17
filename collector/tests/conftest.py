@@ -59,6 +59,10 @@ def pg_dsn():
     with psycopg.connect(f"{base} user=postgres", autocommit=True) as c:
         c.execute((ROOT / "db" / "004_backend_role.sql").read_text())
         c.execute((ROOT / "db" / "004_backend_role.sql").read_text())
+    sql005 = (ROOT / "db" / "005_progress_error.sql").read_text()
+    with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:   # 004 다음, 표 주인으로
+        c.execute(sql005)
+        c.execute(sql005)                                        # 다시 실행해도 안전한지 (권한 유지 포함)
     yield {"owner": f"{base} user=data_app", "collector": f"{base} user=data_collector",
            "exporter": f"{base} user=postgres_exporter", "backend": f"{base} user=backend_ro"}
     subprocess.run([PG_BIN / "pg_ctl", "-D", data, "-m", "immediate", "stop"], capture_output=True)
