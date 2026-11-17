@@ -138,6 +138,21 @@ class Resume(unittest.TestCase):
         self.assertEqual(train.resume_position(300, 100), (3, 0))
 
 
+class ErrorLine(unittest.TestCase):
+    """GPU-188: 실패 이유 한 줄."""
+
+    def test_exception_type_and_message_on_one_line(self):
+        self.assertEqual(train.error_line(ValueError("bad\n  batch")), "ValueError: bad batch")
+        self.assertEqual(train.error_line(KeyError()), "KeyError")
+
+    def test_system_exit_message_or_code(self):
+        self.assertEqual(train.error_line(SystemExit("WORLD_SIZE 2 != config.world_size 4")), "WORLD_SIZE 2 != config.world_size 4")
+        self.assertEqual(train.error_line(SystemExit(3)), "exit code 3")
+
+    def test_long_reason_is_cut(self):
+        self.assertEqual(len(train.error_line(RuntimeError("x" * 900))), 500)
+
+
 class MetricsHelpers(unittest.TestCase):
     """학습 지표 (GPU-96, Monitoring docs/training-metrics.md)."""
 

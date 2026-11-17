@@ -25,7 +25,7 @@ from . import events
 from .log import log
 
 FIELDS = ("status", "step", "total_steps", "loss", "last_checkpoint_step", "checkpoint_every_steps",
-          "checkpoint_count", "step_seconds")
+          "checkpoint_count", "step_seconds", "error")  # error: 학습 실패 이유 한 줄 (GPU-188)
 
 
 def progress_event_id(job_id: str, generation: int, step: int, status: str | None) -> str:

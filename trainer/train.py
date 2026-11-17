@@ -268,6 +268,16 @@ def start_profiler(metrics: Metrics, every: int):
     return prof
 
 
+def error_line(e: BaseException, limit: int = 500) -> str:
+    """실패 이유 한 줄 (GPU-188): progress.json error → sidecar job.progress → DB v_job_status.progress_error."""
+    if isinstance(e, SystemExit):
+        text = e.code if isinstance(e.code, str) else f"exit code {e.code}"
+    else:
+        text = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+    text = " ".join(str(text).split())  # 줄바꿈 · 연속 공백을 한 칸으로
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def read_tokens(paths, tokenizer):
     ids = []
     eos = tokenizer.eos_token_id
@@ -600,10 +610,10 @@ def main():
         progress.write(status="COMPLETED")
     except SystemExit as e:
         if e.code != STOP_EXIT:
-            progress.write(status="FAILED")
+            progress.write(status="FAILED", error=error_line(e))
         raise
-    except BaseException:
-        progress.write(status="FAILED")
+    except BaseException as e:
+        progress.write(status="FAILED", error=error_line(e))
         raise
     finally:
         if prof is not None:
