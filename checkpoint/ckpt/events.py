@@ -41,7 +41,7 @@ class KafkaPublisher:
     """confluent-kafka Producer. 재시도는 librdkafka가 message.timeout.ms(기본 30분)까지 하고,
     그래도 못 보낸 사건은 outbox(S3 대기열)에 넘긴다. outbox가 없으면 로그만."""
 
-    def __init__(self, bootstrap: str, producer=None, outbox=None):
+    def __init__(self, bootstrap: str, producer=None, outbox=None, timeout_ms: int | None = None):
         if producer is None:
             from confluent_kafka import Producer
             producer = Producer({
@@ -50,7 +50,7 @@ class KafkaPublisher:
                 "acks": "all",                      # min.insync.replicas=2와 함께 브로커 1대 장애에도 유실 없음
                 "enable.idempotence": True,         # librdkafka 재시도로 생기는 중복 방지
                 # 30분까지 재시도 후 포기 → outbox. 장애 복구 규약의 재개 대기 30분과 맞춤
-                "message.timeout.ms": int(os.environ.get("KAFKA_MESSAGE_TIMEOUT_MS", "1800000")),
+                "message.timeout.ms": timeout_ms or int(os.environ.get("KAFKA_MESSAGE_TIMEOUT_MS", "1800000")),
                 "linger.ms": 50,
             })
         self.producer = producer
@@ -94,7 +94,8 @@ def _s(b) -> str | None:
     return b.decode() if isinstance(b, (bytes, bytearray)) else b
 
 
-def from_env(bucket: str | None = None, region: str = "us-east-2") -> Publisher:
+def from_env(bucket: str | None = None, region: str = "us-east-2", *, timeout_ms: int | None = None) -> Publisher:
+    """timeout_ms: 전달 재시도 상한. 기본은 KAFKA_MESSAGE_TIMEOUT_MS(30분). 곧 끝나는 ckpt-init은 짧게 준다."""
     bootstrap = os.environ.get("KAFKA_BOOTSTRAP")
     if not bootstrap:
         log("events.disabled", reason="KAFKA_BOOTSTRAP 없음")
@@ -106,18 +107,23 @@ def from_env(bucket: str | None = None, region: str = "us-east-2") -> Publisher:
         outbox = S3Outbox(bucket, prefix=prefix, source=SOURCE, region=region)
     else:
         log("events.outbox_disabled", reason="버킷 없음" if not bucket else "OUTBOX_PREFIX 비어 있음")
-    return KafkaPublisher(bootstrap, outbox=outbox)
+    return KafkaPublisher(bootstrap, outbox=outbox, timeout_ms=timeout_ms)
 
 
 def envelope(*, type_: str, event_id: str, cluster: str, job_id: str, generation: int,
-             payload: dict[str, Any], occurred_at: str | None = None) -> dict:
+             payload: dict[str, Any], occurred_at: str | None = None, source: str = SOURCE) -> dict:
     """수집기 봉투 형식 (collector/envelope.py: event_id · schema_version · type · occurred_at 필수, 시각은 시간대 포함)."""
     return {
         "event_id": event_id, "schema_version": SCHEMA_VERSION, "type": type_,
-        "occurred_at": occurred_at or now_iso(), "source": SOURCE, "cluster": cluster,
+        "occurred_at": occurred_at or now_iso(), "source": source, "cluster": cluster,
         "node": os.environ.get("NODE_NAME"), "job_id": job_id, "generation": generation, "payload": payload,
     }
 
 
 def checkpoint_approved_id(job_id: str, generation: int, step: int) -> str:
     return f"ckpt-{job_id}-g{generation:04d}-s{step:08d}"
+
+
+def init_failed_id(job_id: str, generation: int, rank: int, reason: str) -> str:
+    """ckpt-init 실패 사건 (GPU-120). 같은 세대 · rank · 이유는 한 번만 저장되고, 이유가 바뀌면 새 사건."""
+    return f"init-{job_id}-g{generation:04d}-r{rank}-{reason}"

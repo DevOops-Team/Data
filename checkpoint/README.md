@@ -28,6 +28,26 @@ python -m ckpt.sidecar            # 계속 실행 (--once: 한 사이클만)
 | 6 | DynamoDB 항목 없음 | 제출 과정 문제 |
 | 7 | 승인본 손상 (체크섬 · 크기 불일치, 파일 없음) | 같은 승인본으로는 안 됨 → prev_approved 등 판단 |
 
+### 실패 사건 발행 (Kafka `job.init_failed`, GPU-120)
+
+종료 코드는 EKS Pod 상태에만 남아 관리 클러스터(감시기 · MultiKueue)까지 오지 않는다. 그래서 ckpt-init이 실패하면 **직접 `job.lifecycle`에 `job.init_failed`를 보낸다** (사건은 전부 Kafka 기준). 수집기는 `data.events`에 저장, 복구 컨트롤러가 구독해 판단한다.
+
+- `event_id` = `init-{job}-g{세대 4자리}-r{rank}-{reason}` → 같은 세대 · rank · 이유는 한 번만, 이유가 바뀌면 새 사건
+- `source` = `ckpt-init`, 메시지 키 = `job_id`
+- payload
+
+| 필드 | 뜻 | 예 |
+|---|---|---|
+| `exit_code` | 위 표의 종료 코드 | 7 |
+| `reason` | `ddb_unreachable` · `no_item` · `generation_mismatch` · `owner_claim_failed` · `corrupt` · `download_failed` · `config_mismatch` · `world_size_mismatch` | `corrupt` |
+| `rank` | 실패한 Pod의 rank | 0 |
+| `checkpoint_gen` · `checkpoint_step` | **실제로 복원하려던 체크포인트.** 코드 7이면 받다가 깨진 것. 복원 전에 실패하면 그때 DynamoDB 승인본, 없으면 null. 복구 컨트롤러가 정한 복원 지점과 다르면 HOLD (한송이 11/17) | 1 · 750 |
+| `detail` | 이유별 상세 (`env_gen` · `ddb_gen` · `error` …) | `{"error": "체크섬 불일치 …"}` |
+
+- 최선 노력: 전달 재시도는 20초(`EVENT_TIMEOUT_MS`)까지만 하고 끝낸다 (init이 붙잡혀 복구가 늦어지지 않게). 발행이 실패해도 종료 코드는 그대로
+- 환경 변수: `KAFKA_BOOTSTRAP`(없으면 안 보냄) · `KAFKA_TOPIC_LIFECYCLE`(job.lifecycle) · `NODE_NAME` — **Backend jobspec이 ckpt-init 컨테이너에도 넣어야 함** (지금은 사이드카에만)
+- 보조: 같은 JSON(+ `job_id` · `generation` · `cluster`)을 `/dev/termination-log`(`TERMINATION_LOG`)에도 쓴다 → Pod 상태 `terminated.message`. Kafka가 안 닿을 때(코드 4 등) kubectl로 원인 확인용. 4KB 넘으면 `detail`만 줄임
+
 S3 · DynamoDB 주소는 boto3 표준 `AWS_ENDPOINT_URL`로 바꾼다(로컬만). EKS에선 비워 둔다.
 
 재시도 (규약 10절 · 한송이 「장애 복구 규약」 4절과 맞춤): `RETRY_ATTEMPTS`(3) · `RETRY_BACKOFF`(5,10,20초) · `DOWNLOAD_DEADLINE_S`(600, ckpt-init 전체). 연결 오류만 재시도, 손상 · 조건 거부는 재시도 안 함. 사이드카는 연결 오류로 STOP하거나 죽지 않고 다음 사이클에 다시 함. 업로드가 재시도까지 실패하면 그 step만 미승인.
@@ -93,7 +113,7 @@ cd checkpoint && ../.venv/bin/python examples/dcp_flow.py     # moto, AWS 불필
 
 - `tiny_trainer.py`: FSDP2(CPU · gloo) 작은 trainer. 위 약속 3가지를 지키는 예시
 - `dcp_flow.py`: A 끊김 없는 학습 체크섬 == B step 25 강제 종료 → 승인본 20에서 재개한 학습 체크섬, C 학습 도중 세대 +1 → STOP → 종료
-- **torchrun은 worker의 종료 코드 75를 1로 바꿔 돌려준다.** 컨테이너가 75로 끝나야 하면, torchrun이 끝난 뒤 `$CKPT_DIR/STOP`이 있으면 `exit 75` 하도록 진입 스크립트에서 처리 **[노찬경과 합의 필요]**
+- **torchrun은 worker의 종료 코드 75를 1로 바꿔 돌려준다.** 그래서 Backend jobspec의 trainer 실행 스크립트가 torchrun이 끝난 뒤 `$CKPT_DIR/STOP`이 있으면 `exit 75`, 없으면 원래 코드로 끝낸다 (Backend `internal/service/jobspec`, 11/12 반영). STOP은 사이드카가 DynamoDB 조건부 갱신이 거부됐을 때(세대 · owner 불일치 = 펜싱)만 쓰므로 75 = 펜싱으로 멈춤, 일반 학습 실패는 원래 코드 (한송이 11/17 합의)
 
 ## 남은 것
 
