@@ -170,7 +170,8 @@ def test_late_experiment_links_all_generations(conn, collector_conn):
 
 # ---------- GPU-141: job.progress · v_job_status ----------
 def _progress(step, at, *, gen=1, status="RUNNING", **extra):
-    return msg("job.progress", event_id=f"progress-3f9a1c2e-g{gen:04d}-s{step:08d}", job_id="3f9a1c2e",
+    suffix = "" if status == "RUNNING" else f"-{status.lower()}"     # ckpt-sidecar 규칙 (progress_event_id)
+    return msg("job.progress", event_id=f"progress-3f9a1c2e-g{gen:04d}-s{step:08d}{suffix}", job_id="3f9a1c2e",
                generation=gen, cluster="eks-a", occurred_at=at,
                payload={"status": status, "step": step, "total_steps": 2080, "loss": 3.0 - step / 1000, **extra})
 
@@ -184,6 +185,20 @@ def test_job_progress_keeps_latest_one_row(conn, collector_conn):
     assert r == (1, 300, 1.2, 694)                                  # 빠진 칸은 이전 값 유지
     run(collector_conn, [_progress(5, "2026-11-16T10:20:00.000Z", gen=2)])   # 새 세대는 step이 작아도 반영
     assert one(conn, "SELECT generation, step FROM data.job_progress") == (2, 5)
+
+
+def test_job_progress_failure_reason_reaches_v_job_status(conn, collector_conn):
+    """GPU-188: job.progress의 error → job_progress.error → v_job_status.progress_error. 새 세대에서는 비워짐."""
+    run(collector_conn, [
+        msg("job.submitted", job_id="3f9a1c2e", generation=1, occurred_at="2026-11-16T10:00:00.000Z",
+            payload={"gpus": 2, "strategy": "fsdp"}),
+        _progress(40, "2026-11-16T10:02:00.000Z"),
+        _progress(40, "2026-11-16T10:03:00.000Z", status="FAILED", error="x" * 600),
+    ])
+    status, err = one(conn, "SELECT progress_status, progress_error FROM data.v_job_status")
+    assert status == "FAILED" and err == "x" * 500                       # 500자까지만
+    run(collector_conn, [_progress(1, "2026-11-16T10:10:00.000Z", gen=2)])
+    assert one(conn, "SELECT error FROM data.job_progress")[0] is None
 
 
 def test_job_progress_without_step_keeps_event(conn, collector_conn):
