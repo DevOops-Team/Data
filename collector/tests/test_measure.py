@@ -91,3 +91,15 @@ def test_unknown_experiment_needs_create_flag_and_dry_run_writes_nothing(scenari
     assert out["summary"]["incidents"] == 1
     assert scenario.execute("SELECT count(*) FROM data.results").fetchone()[0] == 0
     assert scenario.execute("SELECT count(*) FROM data.experiments WHERE exp_id = 'new'").fetchone()[0] == 0
+
+
+def test_exp_id_from_submit_without_experiment_started(scenario):
+    """투입기 없이 exp_id만 붙여 제출 (submit_job.py --exp-id): 실험 행이 없어 job_runs.exp_id는 비어 있다.
+    measure --create-exp가 실험 행을 만들고 세대 1 · 2 줄을 모두 연결해 --jobs 없이 찾는다."""
+    event(scenario, "job.submitted", T("00:00"), job="J", gen=1, payload={"exp_id": "e2e-x"})
+    cur = scenario.cursor()
+    assert measure.select_jobs(cur, "e2e-x", None, None, None) == ["J"]          # 연결 전에도 제출 사건으로 찾음
+    out = measure.run(scenario, "e2e-x", create_exp="11/17 E2E")
+    assert out["linked_job_runs"] == 2 and [j["job_id"] for j in out["jobs"]] == ["J"]
+    assert scenario.execute("SELECT DISTINCT exp_id FROM data.job_runs WHERE job_id = 'J'").fetchall() == [("e2e-x",)]
+    assert measure.run(scenario, "e2e-x")["linked_job_runs"] == 0                 # 다시 돌려도 그대로
