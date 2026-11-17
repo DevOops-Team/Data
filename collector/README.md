@@ -60,6 +60,26 @@ docker build -t devoops/collector collector
 docker run --rm -e KAFKA_BOOTSTRAP=... -e PGHOST=... -e PGDATABASE=gpuf_data -e PGUSER=... -e PGPASSWORD=... devoops/collector
 ```
 
+## 측정 (GPU-187)
+
+`collector/measure.py`: 실험의 작업마다 ADR-15 측정값을 계산해 `data.results`에 쓴다. **표 주인(data_app)으로 실행** (data_collector는 results 권한 없음). 같은 입력이면 같은 값 (다시 돌리면 덮어씀).
+
+```bash
+python -m collector.measure --exp e2e-1117                                   # job_runs.exp_id로 작업 선택
+python -m collector.measure --exp e2e-1117 --jobs 0cb3b0c3,3989c020 --create-exp "11/17 E2E"   # exp_id 연결 전
+python -m collector.measure --exp e2e-1117 --since 2026-11-17T09:00+09:00 --until 2026-11-17T18:00+09:00 --create-exp "11/17"
+... --dry-run                                                                # 계산만
+```
+
+| 값 | 계산 |
+|---|---|
+| `detect_s` · `classify_s` · `recover_s` | 그 작업 장애들의 `v_incidents` 평균. MTTD = detect, MTTR = classify + recover |
+| `lost_steps` | 세대 교체마다 (옛 세대 마지막 `job.progress` step − 재개에 쓴 승인 step) 합 |
+| `wait_s` | 첫 제출 → 첫 학습 시작 |
+| `ettr` | (할당 − 정지 − 재계산) ÷ 할당. 정지 = 장애 시작(주입 시각, 없으면 옛 세대 종료) → 새 세대 시작, 재계산 = 날아간 step × step 시간 |
+
+출력 JSON의 `summary`가 실험 단위 발표 지표 (장애 수로 가중한 MTTD · MTTR, 작업 평균 ETTR, 날아간 step 합).
+
 ## 테스트
 
 임시 PostgreSQL 16을 띄우고 실제 `db/001_init.sql`을 적용한 뒤, 가짜 Kafka 메시지로 검증한다 (Kafka 불필요).
