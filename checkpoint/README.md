@@ -54,6 +54,15 @@ S3 · DynamoDB 주소는 boto3 표준 `AWS_ENDPOINT_URL`로 바꾼다(로컬만)
 
 사이드카 추가 환경 변수: `RANK_WAIT_SECONDS`(300) · `KEEP_LOCAL`(2) · `HEARTBEAT_SECONDS`(10) · `POLL_SECONDS`(2) · `IMAGE_DIGEST`
 
+생존 파일 (ADR-44, GPU-213): 메인 루프가 한 바퀴 돌 때마다 `ALIVE_FILE`(기본 `/tmp/sidecar-alive`, 빈 값이면 끔)의 시각을 갱신한다. 별도 스레드가 아니라 루프 안이라, 사이드카가 멈추면(hang) 시각도 멈춘다. jobspec의 exec liveness probe가 이 시각이 300초보다 오래되면 사이드카만 재시작한다 — 업로드 · 승인 상태는 `/ckpt`의 표식 파일(`.uploaded` · `.approved`)에 있어 재시작 뒤 이어서 한다.
+```yaml
+livenessProbe:
+  exec: {command: ["sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /tmp/sidecar-alive) )) -lt 300"]}
+  initialDelaySeconds: 60
+  periodSeconds: 30
+  failureThreshold: 2
+```
+
 ### 승인 사건 발행 (Kafka)
 
 rank 0 사이드카가 승인(OK · ALREADY)하면 `job.lifecycle` 토픽에 `checkpoint.approved`를 보낸다 → 수집기가 `data.checkpoints`에 저장.

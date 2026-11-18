@@ -45,7 +45,7 @@ flowchart LR
 | **체크포인트** | 학습 상태를 S3에 저장하고, 승인된 것만 재개에 쓰도록 보장. 옛 세대가 늦게 쓰는 것을 막음(fencing) | 학습 Pod의 init · 사이드카, S3, DynamoDB |
 | **사건 수집 (Kafka)** | 장애 · 복구 · 잡 상태 사건을 한 형식으로 모아 전달 | 온프레미스 Kafka 브로커(KRaft) |
 | **사건 저장 · 측정 (DB)** | 사건을 DB에 쌓고 MTTD · MTTR · ETTR 계산 | 매니저 클러스터 수집기, 온프레미스 PostgreSQL 16 |
-| **학습 환경 (trainer)** | 학습 Pod의 trainer 이미지(torch · CUDA · transformers)와 기본 `train.py`. 사용자가 올린 train.py는 `/data/code/train.py`로 들어온다 | `trainer/`, `ghcr.io/devoops-team/trainer` |
+| **학습 환경 (trainer)** | 학습 Pod의 trainer 이미지(torch · CUDA · transformers + 시스템 라이브러리 `devoops_ckpt`)와 기본 `train.py`. 사용자가 올린 train.py는 `/data/code/train.py`로 들어오고, 모델 · 데이터셋 · loss만 정해 `ckpt.fit()`을 부른다 — 학습 루프 · 재개 · 저장 · 진행률은 라이브러리가 함 (ADR-42) | `trainer/`, `ghcr.io/devoops-team/trainer` |
 | **보조 도구** | 실험용 시나리오 데이터 준비(trace 가공) | 오프라인 스크립트 |
 
 ---
@@ -54,7 +54,7 @@ flowchart LR
 
 ### 1. 체크포인트 모듈 (`ckpt-init`, `ckpt-sidecar`)
 
-학습 코드(trainer)는 **로컬 `/ckpt`에 저장 · 불러오기만** 합니다. S3 · DynamoDB와의 통신은 전부 init 컨테이너와 사이드카가 맡습니다.
+학습 코드(trainer, `devoops_ckpt`)는 **로컬 `/ckpt`에 저장 · 불러오기만** 합니다. S3 · DynamoDB와의 통신은 전부 init 컨테이너와 사이드카가 맡습니다.
 
 **용어**
 - **세대(generation)**: 잡을 다시 띄울 때마다 +1 되는 번호. DynamoDB가 원본.
