@@ -1,19 +1,46 @@
 # trainer
 
-학습 Pod의 trainer 컨테이너 이미지 `ghcr.io/devoops-team/trainer`는 **학습 환경만** 담는다 (torch 2.5.1 · CUDA 12.4 · transformers).
+학습 Pod의 trainer 컨테이너 이미지 `ghcr.io/devoops-team/trainer`는 **학습 환경 + 시스템 라이브러리 `devoops_ckpt`**를 담는다 (torch 2.5.1 · CUDA 12.4 · transformers).
 `train.py`는 이미지에 없다. 사용자가 제출 화면에서 올리면 Backend가 데이터셋(`datasets/<id>/v1/code/train.py`, manifest에 sha256)에 넣고,
 ckpt-init이 모델 · 데이터와 함께 `/data/code/train.py`로 받아 trainer가 `torchrun /data/code/train.py`로 실행한다.
 
-- `train.py`: 기본 학습 코드(업로드용 예시). 어떤 Hugging Face causal LM이든 FSDP · DDP로 학습. 업로드한 모델은 `/data/model`, 데이터는 `/data/data/*.jsonl`(ckpt-init이 받아 둠)
-- 체크포인트 간격: config.json `checkpoint_policy.interval_seconds`(Young/Daly)를 처음 몇 step의 시간으로 step 간격으로 바꾼다 (설계 문서 5절)
-- ckpt-sidecar 약속: `step-N/` 뒤 `step-N.done`, `STOP`이면 종료 코드 75, 마지막 저장 뒤 `.approved`를 120초 기다림
+## 사용자 코드와 시스템의 분리 (GPU-209)
+
+| 파일 | 누구 것 | 하는 일 |
+|---|---|---|
+| `train.py` | 사용자 (이건 기본 예시) | 학습만: 데이터 읽기 · 모델 · 옵티마이저 · 학습 루프 |
+| `devoops_ckpt.py` | 시스템 (이미지 `/opt/train`, `PYTHONPATH`) | 재개 · 체크포인트 저장 규약 · 진행률 · 학습 지표 · 펜싱 STOP · 마지막 승인 대기 · 실패 기록 · config.json 확인 |
+
+사용자 코드가 부르는 것 (`with ckpt.Session(...) as s:` 안에서, 모든 rank가 같은 순서로):
+
+| 호출 | 필수 | 하는 일 |
+|---|---|---|
+| `ckpt.load_config()` | 권장 | `/code/config.json` 읽기 · 체크섬 · 키 확인 → `(cfg, cfg_hash)` |
+| `s.load(model, optimizer, device)` | 재개하려면 | ckpt-init이 받아 둔 승인본을 불러옴 → 불러온 step (없으면 0) |
+| `s.data_position(start, steps_per_epoch)` | 재개하려면 | 데이터 위치 `(epoch, 건너뛸 배치 수)` |
+| `s.report(step, loss, data_wait)` | 선택 | 진행률(화면) · 지표(:8000) · 저장 간격 측정 · 펜싱 STOP 확인. **안 부르면 측정 전이라 마지막 step에만 저장** |
+| `s.should_save(step)` · `s.save(model, optimizer, step)` | 저장하려면 | 간격마다 `/ckpt/step-N/` + `.done` → 사이드카가 업로드 · 승인 |
+| `s.finish()` | 권장 | 마지막 저장 `.approved`를 최대 120초 대기 → COMPLETED |
+
+- 라이브러리 없이 직접 짜도 된다. 그때는 `devoops_ckpt.py` 맨 위 「규약」(체크포인트 규약 3 · 6 · 7절)을 지켜야 저장 · 재개가 된다
+- 안 지켜도 **안전은 깨지지 않는다**: 옛 세대는 사이드카가 업로드 · 승인 전에 DynamoDB 펜싱으로 막고, relocator가 옛 JobSet을 지워 멈춘다. 재개 · 진행률이 안 될 뿐
+- 한계: Pod의 AWS 권한(ServiceAccount)이 하나라 사용자 코드도 S3 · DynamoDB에 쓸 수 있다 — 실수 방지까지이고 보안 분리는 아님
+
+## 동작
+
+- 체크포인트 간격: config.json `checkpoint_policy.interval_seconds`(Young/Daly)를 처음 `warmup_measure_steps` step의 시간으로 step 간격으로 바꾼다 (설계 문서 5절, `report()` 안)
 - 재개: ckpt-init이 승인본을 `/ckpt/step-N/`에 받고 `/ckpt/resume.json`을 남기면 그 step의 모델 · 옵티마이저(Adam 모멘트)를 불러와
   step N 다음부터 같은 데이터 순서로 이어 간다 (GPU-119). 옵티마이저는 `state`만 저장하고 `param_groups`(lr · betas 등)는 코드 · 스케줄이 정한다
 - 학습 지표 (GPU-96): 모든 rank가 `:8000/metrics`(env `METRICS_PORT`, 0이면 끔)로 8개를 연다 — 이름 · 라벨 · 버킷은 Monitoring 레포 `docs/training-metrics.md`.
   `train_step_seconds`(저장 전까지) · `train_data_wait_seconds` · `train_current_step` · `train_loss`(전체 rank 평균) · `train_stage` · `train_last_checkpoint_step`,
   `train_rank_compute_seconds` · `train_rank_comm_seconds`는 `PROFILE_EVERY`(기본 25) step마다 1 step만 torch.profiler로 (GPU에서만). JobSet: trainer `containerPort: 8000` + Pod `prometheus.io/*` 어노테이션
+- 실패 기록 (GPU-188): `with Session` 안에서 예외로 끝나면 진행률에 `FAILED` + 이유 한 줄 → `v_job_status.progress_error`. STOP(75)은 실패로 안 남김
+
+## 확인
+
 - 테스트: `cd trainer && python3 -m unittest test_train.py` (torch 없이 순수 함수만, prometheus_client가 있으면 /metrics 노출까지)
-- 재개 확인: `python3 trainer/examples/resume_check.py` (torch만, CPU · 2 프로세스) — 끊김 없이 6 step = 3 step 저장 → 새로 불러와 3 step, FSDP · DDP 최종 가중치 차이 0. torch 2.5.1(이미지와 같음) · 2.15에서 통과
-- 직접 쓴 train.py도 위 환경 변수 · 체크포인트 규약(`TRAIN_CONFIG` · `DATA_DIR` · `CKPT_DIR` · `PROGRESS_FILE`, `.done`, `STOP`)을 따라야 저장 · 재개가 된다
+- 재개 확인: `python3 trainer/examples/resume_check.py` (torch만, CPU · gloo · 2 프로세스) — 공개 API(`Session.save` · `load` · `data_position` · `report` · `finish`) 그대로:
+  끊김 없이 6 step = 3 step 저장 → 새로 불러와 3 step, FSDP · DDP 최종 가중치 차이 0 + 마지막 승인 · COMPLETED + STOP 75 · 실패 기록. torch 2.5.1(이미지와 같음) · 2.15에서 통과
 - CI: 이 레포 `.github/workflows/ci.yml` matrix `trainer`. `trainer/`가 바뀐 main push에서 이미지 push → `DEPLOY_IMAGES`에 trainer가 있으면 봇이 Gitops `onprem/platform/backend/overlays/onprem`의 `images:` digest 갱신 → Backend env `TRAINER_IMAGE`
+- **배포 순서**: 새 `train.py`(라이브러리 import)는 라이브러리가 든 trainer 이미지에서만 돈다. 이미지가 먼저 배포된 뒤 새 train.py를 올린다. 옛 train.py(규약 직접 구현)는 새 이미지에서도 그대로 돈다
 - 담당: 김현수 (GPU-154로 Backend 레포에서 이전)
