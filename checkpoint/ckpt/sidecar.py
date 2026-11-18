@@ -226,6 +226,20 @@ class Sidecar:
             log("progress.error", error=repr(e))
 
 
+ALIVE_FILE = "/tmp/sidecar-alive"  # ADR-44: jobspec exec liveness probe가 이 파일의 시각을 본다
+
+
+def touch_alive(path: str) -> None:
+    """메인 루프가 한 바퀴 돌 때마다 시각 갱신. 별도 스레드로 하지 않는다 — 루프가 멈추면 시각도 멈춰야
+    kubelet이 멈춤(hang)을 알아채고 사이드카만 재시작한다. 빈 경로면 끔. 실패해도 사이드카는 계속."""
+    if not path:
+        return
+    try:
+        Path(path).touch()
+    except OSError as e:
+        log("sidecar.alive_failed", path=path, error=repr(e))
+
+
 def main() -> None:
     cfg = Config.from_env()
     publisher = events.from_env(cfg.bucket, cfg.region) if cfg.rank == 0 else events.NullPublisher()   # 발행은 rank 0만
@@ -237,7 +251,9 @@ def main() -> None:
     sc = Sidecar(cfg, FencingTable(cfg.table, region=cfg.region), Store(cfg.bucket, region=cfg.region),
                  publisher=publisher, progress=progress)
     poll = float(os.environ.get("POLL_SECONDS", "2"))
-    log("sidecar.start", job_id=cfg.job_id, gen=cfg.generation, rank=cfg.rank, world_size=cfg.world_size)
+    alive = os.environ.get("ALIVE_FILE", ALIVE_FILE)
+    touch_alive(alive)
+    log("sidecar.start",job_id=cfg.job_id, gen=cfg.generation, rank=cfg.rank, world_size=cfg.world_size)
     once = "--once" in sys.argv
     stopping = False
 
@@ -250,6 +266,7 @@ def main() -> None:
             sc.tick()
         except Exception as e:  # noqa: BLE001 — 예상 못 한 오류도 사이드카를 죽이지 않음 (학습은 계속, 이 step만 미승인)
             log("sidecar.error", error=repr(e))
+        touch_alive(alive)   # 예외로 끝난 tick도 루프는 살아 있음
         if once or sc.stopped:
             break
         time.sleep(poll)
