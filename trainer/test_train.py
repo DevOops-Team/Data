@@ -79,13 +79,13 @@ class CheckpointEvery(unittest.TestCase):
 
 class Helpers(unittest.TestCase):
     def test_total_steps_respects_max_steps(self):
-        self.assertEqual(train.total_steps(100, 10, None), 1000)
-        self.assertEqual(train.total_steps(100, 10, 250), 250)
+        self.assertEqual(ckpt.total_steps(100, 10, None), 1000)
+        self.assertEqual(ckpt.total_steps(100, 10, 250), 250)
 
     def test_lr_warms_up_then_decays(self):
-        self.assertAlmostEqual(train.lr_at(50, 1.0, 100, 1000), 0.5)
-        self.assertAlmostEqual(train.lr_at(1000, 1.0, 100, 1000), 0.1)
-        self.assertAlmostEqual(train.lr_at(1, 1.0, 0, 10), 1.0, places=1)
+        self.assertAlmostEqual(ckpt.lr_at(50, 1.0, 100, 1000), 0.5)
+        self.assertAlmostEqual(ckpt.lr_at(1000, 1.0, 100, 1000), 0.1)
+        self.assertAlmostEqual(ckpt.lr_at(1, 1.0, 0, 10), 1.0, places=1)
 
     def test_split_blocks_drops_the_tail_and_needs_one_block(self):
         self.assertEqual(train.split_blocks(list(range(7)), 3), [[0, 1, 2], [3, 4, 5]])
