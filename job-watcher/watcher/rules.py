@@ -13,9 +13,13 @@
              job.failed                    JobSet Failed=True                                 조건 시각
              job.fenced                    종료 조건 없이 삭제 + 이 JobSet을 가리키는 RelocationRequest 있음
                                            (payload: request_id · action)                      deletionTimestamp, 없으면 본 시각
-             job.stopped                   종료 조건 없이 삭제 + RelocationRequest 없음 (사용자 · Backend 중지)
+             job.cancelled                 종료 조건 없이 삭제 + RelocationRequest 없음 + 주석 devoops/stop-reason=user
+                                           (Backend 사용자 중단, payload: reason · requested_at, 한송이 11/18 동의)
+             job.stopped                   종료 조건 없이 삭제 + RelocationRequest 없음 + 중단 주석 없음 (수동 삭제 등)
 
-종료(end)는 세대마다 하나: completed · failed · fenced · stopped가 같은 key("end")를 쓴다.
+종료(end)는 세대마다 하나: completed · failed · fenced · cancelled · stopped가 같은 key("end")를 쓴다.
+재배치 요청이 있으면 중단 주석이 있어도 fenced (복구가 먼저). 삭제를 놓쳐 재목록에서 발견하면 마지막으로 본
+객체의 주석으로 판정한다 — 주석을 단 수정을 못 봤으면 stopped로 나갈 수 있다.
 이미 끝난(Completed · Failed) JobSet을 나중에 지우면 새 사건이 없다. 감시기가 재시작해 판정이 달라져도
 수집기는 먼저 들어간 하나만 남긴다 (event_id 중복 무시).
 """
@@ -67,6 +71,8 @@ def plan(s: Snapshot, *, observed_at: str, emit_first_submitted: bool = False) -
     elif s.deleted:
         if s.relocated:
             add("end", "job.fenced", s.deleted_at, request_id=s.relocation_request_id, action=s.relocation_action)
+        elif s.stop_reason == "user":
+            add("end", "job.cancelled", s.deleted_at, reason=s.stop_reason, requested_at=s.stop_requested_at)
         else:
             add("end", "job.stopped", s.deleted_at)
     return out
