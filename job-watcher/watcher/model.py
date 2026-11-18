@@ -7,6 +7,7 @@
   이름   job-{작업ID}-g{세대 4자리}        예: job-3f9a1c2e-g0002
   라벨   devoops/generation · kueue.x-k8s.io/queue-name · (있으면) devoops/job-id
   주석   devoops/recovery-id(재배치 실행기 재제출본에만) · (있으면) devoops/exp-id · devoops/config-sha256
+         devoops/stop-reason · devoops/stop-requested-at (Backend 사용자 중단이 지우기 전에 닮, GPU-120 11/18)
 
 재배치 요청 RelocationRequest (scheduling.devoops.site, ADR-19): 복구 컨트롤러가 만들고 재배치 실행기가 처리한다.
   spec.jobRef = "training/<옛 JobSet 이름>" · spec.requestId(= recovery_id) · spec.action
@@ -26,6 +27,8 @@ LABEL_QUEUE = "kueue.x-k8s.io/queue-name"
 ANN_EXP = "devoops/exp-id"
 ANN_RECOVERY = "devoops/recovery-id"
 ANN_CONFIG = "devoops/config-sha256"
+ANN_STOP_REASON = "devoops/stop-reason"           # "user" = 사용자 중단 → job.cancelled
+ANN_STOP_AT = "devoops/stop-requested-at"
 GPU_RESOURCE = "nvidia.com/gpu"
 TRAINER = "trainer"
 
@@ -49,6 +52,8 @@ class Snapshot:
     recovery_id: str | None = None
     config_sha256: str | None = None
     image_digest: str | None = None
+    stop_reason: str | None = None           # 삭제 전에 Backend가 단 중단 사유 (user)
+    stop_requested_at: str | None = None
     # JobSet status (MultiKueue가 워커에서 복사)
     all_ready: bool = False
     completed_at: str | None = None
@@ -181,6 +186,7 @@ def snapshot(jobset: dict[str, Any], workload: dict[str, Any] | None = None, *,
         created_at=meta.get("creationTimestamp"), queue=labels.get(LABEL_QUEUE), gpus=gpus(jobset),
         exp_id=ann.get(ANN_EXP), recovery_id=ann.get(ANN_RECOVERY), config_sha256=ann.get(ANN_CONFIG),
         image_digest=image_digest(jobset), all_ready=all_ready(jobset),
+        stop_reason=ann.get(ANN_STOP_REASON), stop_requested_at=ann.get(ANN_STOP_AT),
         completed_at=condition_time(jobset, "Completed"), failed_at=condition_time(jobset, "Failed"),
         failed_message=_condition_message(jobset, "Failed"),
         deleted=deleted, deleted_at=meta.get("deletionTimestamp"),
