@@ -8,10 +8,36 @@ ckpt-init이 모델 · 데이터와 함께 `/data/code/train.py`로 받아 train
 
 | 파일 | 누구 것 | 하는 일 |
 |---|---|---|
-| `train.py` | 사용자 (이건 기본 예시) | 학습만: 데이터 읽기 · 모델 · 옵티마이저 · 학습 루프 |
-| `devoops_ckpt.py` | 시스템 (이미지 `/opt/train`, `PYTHONPATH`) | 재개 · 체크포인트 저장 규약 · 진행률 · 학습 지표 · 펜싱 STOP · 마지막 승인 대기 · 실패 기록 · config.json 확인 |
+| `train.py` | 사용자 (이건 기본 예시) | 모델 · 데이터셋 · loss 함수만 정한다 |
+| `devoops_ckpt.py` | 시스템 (이미지 `/opt/train`, `PYTHONPATH`) | 학습 루프 · 분산 감싸기(FSDP/DDP) · DataLoader · 학습률 · 재개 · 체크포인트 저장 규약 · 진행률 · 학습 지표 · 펜싱 STOP · 마지막 승인 대기 · 실패 기록 · config.json 확인 |
 
-사용자 코드가 부르는 것 (`with ckpt.Session(...) as s:` 안에서, 모든 rank가 같은 순서로):
+### 기본: `ckpt.fit()` (루프 소유형)
+
+```python
+import devoops_ckpt as ckpt
+
+def loss_fn(model, batch):                 # batch는 이미 GPU에 (원소 하나인 tuple은 풀어서)
+    return model(input_ids=batch, labels=batch).loss
+
+ckpt.fit(model=load_model, dataset=load_dataset, loss_fn=loss_fn)
+```
+
+| 인자 | 필수 | 내용 |
+|---|---|---|
+| `model` | O | `nn.Module` 또는 만드는 함수 (감싸기 전). 함수면 fit 안에서 만들어 실패가 FAILED로 남는다 |
+| `dataset` | O | torch `Dataset` 또는 만드는 함수 |
+| `loss_fn` | O | `loss_fn(model, batch) -> loss` |
+| `optimizer` | | `optimizer(params) -> Optimizer`. 기본 `AdamW(lr=config.learning_rate, weight_decay=0.1)` |
+| `lr_schedule` | | `lr_schedule(step, total) -> lr` (None이면 안 바꿈). 기본 warmup → cosine(10%까지) |
+| `max_grad_norm` | | 기본 1.0, None이면 clip 안 함 |
+| `collate_fn` | | DataLoader에 그대로 |
+
+배치 크기 · epoch · max_steps · seed · 학습 방식(fsdp/ddp) · world_size는 config.json(제출 화면 값)에서 온다.
+
+### 루프를 직접 짤 때: `ckpt.Session`
+
+gradient accumulation · 옵티마이저 여러 개처럼 `fit()`이 못 하는 루프는 `with ckpt.Session(...) as s:` 안에서 직접 부른다 (모든 rank가 같은 순서로).
+`fit()`도 내부에서 이걸 쓴다.
 
 | 호출 | 필수 | 하는 일 |
 |---|---|---|
@@ -39,8 +65,8 @@ ckpt-init이 모델 · 데이터와 함께 `/data/code/train.py`로 받아 train
 ## 확인
 
 - 테스트: `cd trainer && python3 -m unittest test_train.py` (torch 없이 순수 함수만, prometheus_client가 있으면 /metrics 노출까지)
-- 재개 확인: `python3 trainer/examples/resume_check.py` (torch만, CPU · gloo · 2 프로세스) — 공개 API(`Session.save` · `load` · `data_position` · `report` · `finish`) 그대로:
-  끊김 없이 6 step = 3 step 저장 → 새로 불러와 3 step, FSDP · DDP 최종 가중치 차이 0 + 마지막 승인 · COMPLETED + STOP 75 · 실패 기록. torch 2.5.1(이미지와 같음) · 2.15에서 통과
+- 재개 확인: `python3 trainer/examples/resume_check.py` (torch만, CPU · gloo · 2 프로세스) — 공개 API `fit()` 그대로:
+  끊김 없이 6 step = 3 step 저장 → 새로 불러와 3 step, FSDP · DDP 최종 가중치 차이 0 + 마지막 승인 · COMPLETED + loss 예외 → FAILED + 이유 + (Session) STOP 75. torch 2.5.1(이미지와 같음) · 2.15에서 통과
 - CI: 이 레포 `.github/workflows/ci.yml` matrix `trainer`. `trainer/`가 바뀐 main push에서 이미지 push → `DEPLOY_IMAGES`에 trainer가 있으면 봇이 Gitops `onprem/platform/backend/overlays/onprem`의 `images:` digest 갱신 → Backend env `TRAINER_IMAGE`
 - **배포 순서**: 새 `train.py`(라이브러리 import)는 라이브러리가 든 trainer 이미지에서만 돈다. 이미지가 먼저 배포된 뒤 새 train.py를 올린다. 옛 train.py(규약 직접 구현)는 새 이미지에서도 그대로 돈다
 - 담당: 김현수 (GPU-154로 Backend 레포에서 이전)
