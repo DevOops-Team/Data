@@ -22,7 +22,8 @@
 | `job.completed` | JobSet `Completed=True` | 조건 시각 |
 | `job.failed` | JobSet `Failed=True` | 조건 시각 |
 | `job.fenced` | 종료 조건 없이 삭제 + `spec.jobRef`가 이 JobSet인 RelocationRequest 있음. payload `request_id` · `action` | `deletionTimestamp` |
-| `job.stopped` | 종료 조건 없이 삭제 + RelocationRequest 없음 (사용자 · Backend 중지) | `deletionTimestamp` |
+| `job.cancelled` | 종료 조건 없이 삭제 + RelocationRequest 없음 + 주석 `devoops/stop-reason: user` (Backend 사용자 중단이 지우기 전에 닮, payload `reason` · `requested_at`) → 화면 `CANCELLED` | `deletionTimestamp` |
+| `job.stopped` | 종료 조건 없이 삭제 + RelocationRequest 없음 + 중단 주석 없음 (수동 삭제 등) | `deletionTimestamp` |
 
 - `event_id = job-{작업ID}-g{세대 4자리}-{key}` (key: submitted · admitted · placed · started · end). 세대마다 종료는 하나(`-end`). 이미 끝난 잡을 나중에 지우면 사건 없음
 - `payload.time_source`: `k8s`(쿠버네티스가 찍은 시각) · `observed`(감시기가 본 시각)

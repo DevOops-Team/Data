@@ -11,6 +11,12 @@
 0 정상 · 2 세대 불일치 · 3 owner 선점 실패 · 4 연결 오류로 다운로드 실패(재시도 · 제한 시간 초과, 다시 띄우면 될 수 있음)
 5 승인본이 현재 작업과 맞지 않음 · 6 항목 없음 · 7 승인본 손상(체크섬 · 크기 불일치, 파일 없음 — 같은 승인본으로는 안 됨)
 
+실패 보고 (GPU-120, 사건은 전부 Kafka 기준)
+- Kafka job.lifecycle에 job.init_failed 발행 → 수집기(DB · 화면) · 복구 컨트롤러가 받는다. KAFKA_BOOTSTRAP 없으면 안 보냄.
+  payload: exit_code · reason · rank · checkpoint_gen · checkpoint_step · detail
+  checkpoint_gen/step: 실제로 복원하려던 체크포인트 (코드 7이면 받다가 깨진 것). 복원 전에 실패하면 그때 DynamoDB 승인본
+- 보조: /dev/termination-log(env TERMINATION_LOG)에 같은 JSON → Pod 상태 terminated.message (Kafka가 안 닿을 때 kubectl로 확인)
+
 재시도: 일시 오류는 3회(5 → 10 → 20초), 다운로드 전체 제한 DOWNLOAD_DEADLINE_S(기본 600초).
 복구 컨트롤러의 '복원 · 학습 진행 확인 30분' 안에 끝나도록 한다.
 """
@@ -23,6 +29,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import layout
+from . import events
 from .config import Config
 from .fencing import FencingTable
 from .log import log
@@ -30,6 +37,37 @@ from .retry import CorruptError, RetryPolicy, is_transient
 from .storage import Store, sha256_file
 
 EXIT_OK, EXIT_GEN, EXIT_OWNER, EXIT_DOWNLOAD, EXIT_MISMATCH, EXIT_NO_ITEM, EXIT_CORRUPT = 0, 2, 3, 4, 5, 6, 7
+
+
+# 마지막 실패 (main이 Kafka · TERMINATION_LOG로 보고). run()이 시작할 때 비운다
+FAILURE: dict = {}
+TERMINATION_LIMIT = 4096  # 쿠버네티스 terminationMessage 한도 (바이트)
+EVENT_TIMEOUT_MS = 20_000  # 실패 사건 전달 재시도 상한. init 컨테이너가 오래 붙잡혀 복구가 늦어지지 않게
+
+
+def _fail(code: int, reason: str, **detail) -> int:
+    """실패를 로그와 FAILURE에 남기고 종료 코드를 돌려준다 (GPU-120 termination-log)."""
+    log(reason, **detail)
+    FAILURE.update(exit_code=code, reason=reason.removeprefix("init."), detail=detail)
+    return code
+
+
+def failure_info(cfg: Config, code: int) -> dict:
+    """실패 정보 (job.init_failed payload · termination-log 공통)."""
+    return {"exit_code": code, "reason": FAILURE.get("reason", "unknown"), "job_id": cfg.job_id,
+            "generation": cfg.generation, "cluster": cfg.cluster, "rank": cfg.rank,
+            "checkpoint_gen": FAILURE.get("checkpoint_gen"), "checkpoint_step": FAILURE.get("checkpoint_step"),
+            "detail": FAILURE.get("detail", {})}
+
+
+def termination_message(cfg: Config, code: int) -> str:
+    """Pod 상태(terminated.message)에 남는 실패 정보 JSON 한 줄 (4KB 이하). Kafka 사건의 보조."""
+    body = failure_info(cfg, code)
+    text = json.dumps(body, ensure_ascii=False, default=str)
+    if len(text.encode()) > TERMINATION_LIMIT:  # 긴 오류 문구는 detail만 줄인다
+        body["detail"] = {k: str(v)[:200] for k, v in body["detail"].items()}
+        text = json.dumps(body, ensure_ascii=False, default=str)[:TERMINATION_LIMIT]
+    return text
 
 
 def _s3_key(uri: str) -> tuple[str, str]:
@@ -40,29 +78,27 @@ def _s3_key(uri: str) -> tuple[str, str]:
 def run(cfg: Config, fencing: FencingTable, store: Store, policy: RetryPolicy | None = None) -> int:
     policy = policy or RetryPolicy(deadline_s=float(os.environ.get("DOWNLOAD_DEADLINE_S", "600")))
     policy.started()
+    FAILURE.clear()
     try:
         item = policy.call(lambda: fencing.get(cfg.job_id))
     except Exception as e:  # noqa: BLE001
-        log("init.ddb_unreachable", error=repr(e))
-        return EXIT_DOWNLOAD
+        return _fail(EXIT_DOWNLOAD, "init.ddb_unreachable", error=repr(e))
     if item is None:
-        log("init.no_item", job_id=cfg.job_id)
-        return EXIT_NO_ITEM
+        return _fail(EXIT_NO_ITEM, "init.no_item", job_id=cfg.job_id)
+    FAILURE.update(checkpoint_gen=item.approved_gen, checkpoint_step=item.approved_step, ddb_generation=item.generation)
 
     # 1. 세대 확인
     if item.generation != cfg.generation:
-        log("init.generation_mismatch", env_gen=cfg.generation, ddb_gen=item.generation)
-        return EXIT_GEN
+        return _fail(EXIT_GEN, "init.generation_mismatch", env_gen=cfg.generation, ddb_gen=item.generation)
 
     # 2. owner 선점 (조건 실패는 재시도하지 않음, 연결 오류만 재시도)
     try:
         claimed = policy.call(lambda: fencing.claim_owner(cfg.job_id, cfg.generation, cfg.cluster))
     except Exception as e:  # noqa: BLE001
-        log("init.ddb_unreachable", error=repr(e))
-        return EXIT_DOWNLOAD
+        return _fail(EXIT_DOWNLOAD, "init.ddb_unreachable", error=repr(e))
     if not claimed:
-        log("init.owner_claim_failed", cluster=cfg.cluster, owner=(fencing.get(cfg.job_id) or item).owner)
-        return EXIT_OWNER
+        return _fail(EXIT_OWNER, "init.owner_claim_failed", cluster=cfg.cluster,
+                     owner=(fencing.get(cfg.job_id) or item).owner)
     log("init.owner_claimed", cluster=cfg.cluster, gen=cfg.generation)
 
     try:
@@ -101,22 +137,20 @@ def run(cfg: Config, fencing: FencingTable, store: Store, policy: RetryPolicy | 
             return EXIT_OK
 
         gen, step = item.approved_gen, item.approved_step
+        FAILURE.update(checkpoint_gen=gen, checkpoint_step=step)  # 실제로 복원하려는 체크포인트 (코드 7이면 이게 깨진 것)
         step_dir = layout.local_step_dir(cfg.ckpt_dir, step)
         manifest = store.download_checkpoint(cfg.job_id, gen, step, step_dir, policy)
     except CorruptError as e:
-        log("init.corrupt", error=str(e))          # 같은 승인본으로는 안 됨 → 복구 컨트롤러가 prev_approved 등 판단
-        return EXIT_CORRUPT
+        # 같은 승인본으로는 안 됨 → 복구 컨트롤러가 prev_approved 등 판단
+        return _fail(EXIT_CORRUPT, "init.corrupt", error=str(e))
     except Exception as e:  # noqa: BLE001 — 그 밖의 실패도 시작하지 않고 보고
-        log("init.download_failed", error=repr(e), transient=is_transient(e))
-        return EXIT_DOWNLOAD
+        return _fail(EXIT_DOWNLOAD, "init.download_failed", error=repr(e), transient=is_transient(e))
 
     # 승인본이 지금 작업과 맞는지 (규약 7절 3번)
     if cfg.config_sha256 and manifest.get("config_sha256") and manifest["config_sha256"] != cfg.config_sha256:
-        log("init.config_mismatch", manifest=manifest["config_sha256"], env=cfg.config_sha256)
-        return EXIT_MISMATCH
+        return _fail(EXIT_MISMATCH, "init.config_mismatch", manifest=manifest["config_sha256"], env=cfg.config_sha256)
     if manifest.get("world_size") != cfg.world_size:
-        log("init.world_size_mismatch", manifest=manifest.get("world_size"), env=cfg.world_size)
-        return EXIT_MISMATCH
+        return _fail(EXIT_MISMATCH, "init.world_size_mismatch", manifest=manifest.get("world_size"), env=cfg.world_size)
 
     layout.done_marker(cfg.ckpt_dir, step).touch()
     layout.approved_marker(cfg.ckpt_dir, step).touch()
@@ -133,9 +167,30 @@ def _write_resume(ckpt_dir: Path, gen: int | None, step: int | None) -> None:
     (ckpt_dir / "resume.json").write_text(json.dumps(body, indent=2))
 
 
+def publish_failure(cfg: Config, code: int, publisher: events.Publisher) -> None:
+    """job.lifecycle에 job.init_failed (최선 노력: 못 보내도 종료 코드 · termination-log는 그대로)."""
+    info = failure_info(cfg, code)
+    payload = {k: v for k, v in info.items() if k not in ("job_id", "generation", "cluster")}
+    ev = events.envelope(type_="job.init_failed", source="ckpt-init",
+                         event_id=events.init_failed_id(cfg.job_id, cfg.generation, cfg.rank, info["reason"]),
+                         cluster=cfg.cluster, job_id=cfg.job_id, generation=cfg.generation, payload=payload)
+    publisher.publish(topic=os.environ.get("KAFKA_TOPIC_LIFECYCLE", "job.lifecycle"), key=cfg.job_id, value=ev)
+    publisher.flush(EVENT_TIMEOUT_MS / 1000)
+
+
 def main() -> None:
     cfg = Config.from_env()
-    sys.exit(run(cfg, FencingTable(cfg.table, region=cfg.region), Store(cfg.bucket, region=cfg.region)))
+    code = run(cfg, FencingTable(cfg.table, region=cfg.region), Store(cfg.bucket, region=cfg.region))
+    if code != EXIT_OK:  # 실패 이유 · 세대 · 복원하려던 체크포인트 전달 (GPU-120)
+        try:
+            publish_failure(cfg, code, events.from_env(timeout_ms=EVENT_TIMEOUT_MS))
+        except Exception as e:  # noqa: BLE001 — 사건 발행 실패로 종료 코드가 바뀌면 안 됨
+            log("init.event_failed", error=repr(e))
+        try:
+            Path(os.environ.get("TERMINATION_LOG", "/dev/termination-log")).write_text(termination_message(cfg, code))
+        except OSError as e:
+            log("init.termination_log_failed", error=repr(e))
+    sys.exit(code)
 
 
 if __name__ == "__main__":

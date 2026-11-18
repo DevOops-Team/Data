@@ -8,7 +8,8 @@ from pathlib import Path
 
 from ckpt import layout
 from ckpt.config import Config
-from ckpt.init_main import EXIT_CORRUPT, EXIT_GEN, EXIT_OK, EXIT_OWNER
+from ckpt import init_main
+from ckpt.init_main import EXIT_CORRUPT, EXIT_GEN, EXIT_OK, EXIT_OWNER, termination_message
 from ckpt.init_main import run as init_run
 from ckpt.sidecar import Sidecar
 
@@ -77,8 +78,11 @@ def test_save_approve_fail_resume(names, fencing, store, tmp_path):
     assert not store.exists(layout.s3_rank_list_key(JOB, 1, 200, 0))
     assert fencing.get(JOB).approved_step == 100
 
-    # ⑤ 옛 세대 설정으로 init을 다시 띄우면 시작 안 함
+    # ⑤ 옛 세대 설정으로 init을 다시 띄우면 시작 안 함 → termination-log에 이유 · 승인본 (GPU-120)
     assert init_run(g1[0], fencing, store) == EXIT_GEN
+    msg = json.loads(termination_message(g1[0], EXIT_GEN))
+    assert msg["reason"] == "generation_mismatch" and (msg["generation"], msg["detail"]["ddb_gen"]) == (1, 2)
+    assert (msg["checkpoint_gen"], msg["checkpoint_step"], msg["cluster"]) == (1, 100, "eks-a")
 
     # ⑥ 세대 2 재개 (eks-b, 새 Pod) → 승인본(gen 1, step 100) 전체 다운로드, 101부터
     g2 = [cfg(names, tmp_path, gen=2, rank=r, cluster="eks-b", pod=f"g2-r{r}") for r in range(WORLD)]
@@ -125,6 +129,67 @@ def test_corrupted_checkpoint_blocks_start(names, fencing, store, tmp_path):
     fencing.advance_generation(JOB, 1, "r1")
     c2 = Config(**{**c.__dict__, "generation": 2, "ckpt_dir": tmp_path / "p2" / "ckpt"})
     assert init_run(c2, fencing, store) == EXIT_CORRUPT
+    msg = json.loads(termination_message(c2, EXIT_CORRUPT))
+    assert (msg["exit_code"], msg["reason"], msg["checkpoint_gen"], msg["checkpoint_step"]) == (7, "corrupt", 1, 100)
+
+    # 같은 정보가 Kafka job.init_failed로 (사건은 전부 Kafka 기준, GPU-120)
+    pub = FakePublisher()
+    init_main.publish_failure(c2, EXIT_CORRUPT, pub)
+    [(topic, key, ev)] = pub.sent
+    assert (topic, key, ev["type"], ev["source"], ev["generation"], ev["cluster"]) == (
+        "job.lifecycle", JOB, "job.init_failed", "ckpt-init", 2, "eks-a")
+    assert ev["event_id"] == f"init-{JOB}-g0002-r0-corrupt"
+    assert {k: ev["payload"][k] for k in ("exit_code", "reason", "rank", "checkpoint_gen", "checkpoint_step")} == {
+        "exit_code": 7, "reason": "corrupt", "rank": 0, "checkpoint_gen": 1, "checkpoint_step": 100}
+    assert pub.flushed
+
+
+class FakePublisher:
+    def __init__(self):
+        self.sent, self.flushed = [], False
+
+    def publish(self, *, topic, key, value):
+        self.sent.append((topic, key, value))
+
+    def flush(self, timeout=5.0):
+        self.flushed = True
+
+
+def test_termination_message_fits_kubernetes_limit(names, tmp_path, monkeypatch):
+    c = cfg(names, tmp_path, gen=1, rank=0, cluster="eks-a", pod="p")
+    monkeypatch.setattr(init_main, "FAILURE", {"reason": "download_failed", "detail": {"error": "x" * 10000}})
+    text = termination_message(c, 4)
+    assert len(text.encode()) <= 4096 and json.loads(text)["reason"] == "download_failed"
+
+
+def test_main_writes_termination_log_only_on_failure(names, fencing, tmp_path, monkeypatch):
+    out = tmp_path / "termination-log"
+    monkeypatch.setenv("TERMINATION_LOG", str(out))
+    c = cfg(names, tmp_path, gen=1, rank=0, cluster="eks-a", pod="p")       # 펜싱 항목이 없음 → 6
+    monkeypatch.setattr(init_main.Config, "from_env", classmethod(lambda cls: c))
+    pub = FakePublisher()
+    monkeypatch.setattr(init_main.events, "from_env", lambda **kw: pub)
+    try:
+        init_main.main()
+    except SystemExit as e:
+        assert e.code == 6
+    assert json.loads(out.read_text())["reason"] == "no_item"
+    assert [ev["payload"]["reason"] for _, _, ev in pub.sent] == ["no_item"]
+
+
+def test_event_failure_does_not_change_exit_code(names, fencing, tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINATION_LOG", str(tmp_path / "termination-log"))
+    c = cfg(names, tmp_path, gen=1, rank=0, cluster="eks-a", pod="p")
+    monkeypatch.setattr(init_main.Config, "from_env", classmethod(lambda cls: c))
+
+    def boom(**kw):
+        raise RuntimeError("kafka down")
+    monkeypatch.setattr(init_main.events, "from_env", boom)
+    try:
+        init_main.main()
+    except SystemExit as e:
+        assert e.code == 6                                                   # 발행 실패와 상관없이 원래 코드
+    assert json.loads((tmp_path / "termination-log").read_text())["reason"] == "no_item"
 
 
 def test_missing_rank_is_not_approved(names, fencing, store, tmp_path):

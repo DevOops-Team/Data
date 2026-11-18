@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+import devoops_ckpt as ckpt  # noqa: E402
 import train  # noqa: E402
 
 CONFIG = {
@@ -36,14 +37,14 @@ def raw(cfg=None) -> bytes:
 
 class ParseConfig(unittest.TestCase):
     def test_reads_the_backend_config_and_its_hash(self):
-        cfg, digest = train.parse_config(raw(), hashlib.sha256(raw()).hexdigest())
+        cfg, digest = ckpt.parse_config(raw(), hashlib.sha256(raw()).hexdigest())
         self.assertEqual(cfg.checkpoint_policy.interval_seconds, 844)
         self.assertEqual(cfg.dataset.format, "text-jsonl")
         self.assertEqual(digest, hashlib.sha256(raw()).hexdigest())
 
     def test_rejects_a_changed_config(self):
         with self.assertRaises(SystemExit):
-            train.parse_config(raw(), "0" * 64)
+            ckpt.parse_config(raw(), "0" * 64)
 
     def test_rejects_missing_or_unknown_keys(self):
         for change in ({"checkpoint_every_steps": 250}, {"checkpoint_policy": None}):
@@ -54,24 +55,24 @@ class ParseConfig(unittest.TestCase):
                 else:
                     cfg[k] = v
             with self.subTest(change=change), self.assertRaises(SystemExit):
-                train.parse_config(raw(cfg), None)
+                ckpt.parse_config(raw(cfg), None)
 
     def test_rejects_the_old_schema_and_mismatched_formats(self):
         for change in ({"schema_version": 1}, {"checkpoint_format": "ddp-pt"}, {"training_mode": "zero3"}):
             with self.subTest(change=change), self.assertRaises(SystemExit):
-                train.parse_config(raw({**CONFIG, **change}), None)
+                ckpt.parse_config(raw({**CONFIG, **change}), None)
 
 
 class CheckpointEvery(unittest.TestCase):
     def test_long_runs_save_more_often_than_short_runs(self):
         # 10000 step × 0.5 s = 5000 s, τ 844 s → 5번, 2000 step마다
-        self.assertEqual(train.checkpoint_every(10000, 0.5, 844), (2000, 5))
+        self.assertEqual(ckpt.checkpoint_every(10000, 0.5, 844), (2000, 5))
         # 1000 step × 0.5 s = 500 s < τ → 1번 (마지막 step)
-        self.assertEqual(train.checkpoint_every(1000, 0.5, 844), (1000, 1))
+        self.assertEqual(ckpt.checkpoint_every(1000, 0.5, 844), (1000, 1))
 
     def test_validation_settings_give_several_saves_in_minutes(self):
         # 검증용 τ 141 s, 15분 학습(1800 step × 0.5 s) → 6번
-        every, count = train.checkpoint_every(1800, 0.5, 141)
+        every, count = ckpt.checkpoint_every(1800, 0.5, 141)
         self.assertEqual(count, 6)
         self.assertEqual(every, 300)
 
@@ -100,8 +101,8 @@ class Helpers(unittest.TestCase):
     def test_wait_approved_sees_the_sidecar_marker(self):
         with tempfile.TemporaryDirectory() as d:
             open(os.path.join(d, "step-00000010.approved"), "w").close()
-            self.assertTrue(train.wait_approved(d, 10, 1))
-            self.assertFalse(train.wait_approved(d, 20, 0))
+            self.assertTrue(ckpt.wait_approved(d, 10, 1))
+            self.assertFalse(ckpt.wait_approved(d, 20, 0))
 
 
 class Resume(unittest.TestCase):
@@ -113,44 +114,44 @@ class Resume(unittest.TestCase):
 
     def test_no_resume_file_means_start_from_zero(self):
         with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(train.read_resume(d), (0, None))
+            self.assertEqual(ckpt.read_resume(d), (0, None))
 
     def test_fresh_start_written_by_init(self):
         with tempfile.TemporaryDirectory() as d:
             self.write(d, {"resume": False, "approved_gen": None, "approved_step": None, "step_dir": None, "start_step": 1})
-            self.assertEqual(train.read_resume(d), (0, None))
+            self.assertEqual(ckpt.read_resume(d), (0, None))
 
     def test_resume_returns_the_approved_step_and_folder(self):
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, "step-00001200"))
             self.write(d, {"resume": True, "approved_gen": 1, "approved_step": 1200, "step_dir": "step-00001200", "start_step": 1201})
-            self.assertEqual(train.read_resume(d), (1200, os.path.join(d, "step-00001200")))
+            self.assertEqual(ckpt.read_resume(d), (1200, os.path.join(d, "step-00001200")))
 
     def test_resume_without_the_folder_fails_instead_of_starting_over(self):
         with tempfile.TemporaryDirectory() as d:
             self.write(d, {"resume": True, "approved_gen": 1, "approved_step": 1200, "step_dir": "step-00001200", "start_step": 1201})
             with self.assertRaises(SystemExit):
-                train.read_resume(d)
+                ckpt.read_resume(d)
 
     def test_resume_position_skips_batches_already_done_in_that_epoch(self):
-        self.assertEqual(train.resume_position(0, 100), (0, 0))
-        self.assertEqual(train.resume_position(250, 100), (2, 50))
-        self.assertEqual(train.resume_position(300, 100), (3, 0))
+        self.assertEqual(ckpt.resume_position(0, 100), (0, 0))
+        self.assertEqual(ckpt.resume_position(250, 100), (2, 50))
+        self.assertEqual(ckpt.resume_position(300, 100), (3, 0))
 
 
 class ErrorLine(unittest.TestCase):
     """GPU-188: 실패 이유 한 줄."""
 
     def test_exception_type_and_message_on_one_line(self):
-        self.assertEqual(train.error_line(ValueError("bad\n  batch")), "ValueError: bad batch")
-        self.assertEqual(train.error_line(KeyError()), "KeyError")
+        self.assertEqual(ckpt.error_line(ValueError("bad\n  batch")), "ValueError: bad batch")
+        self.assertEqual(ckpt.error_line(KeyError()), "KeyError")
 
     def test_system_exit_message_or_code(self):
-        self.assertEqual(train.error_line(SystemExit("WORLD_SIZE 2 != config.world_size 4")), "WORLD_SIZE 2 != config.world_size 4")
-        self.assertEqual(train.error_line(SystemExit(3)), "exit code 3")
+        self.assertEqual(ckpt.error_line(SystemExit("WORLD_SIZE 2 != config.world_size 4")), "WORLD_SIZE 2 != config.world_size 4")
+        self.assertEqual(ckpt.error_line(SystemExit(3)), "exit code 3")
 
     def test_long_reason_is_cut(self):
-        self.assertEqual(len(train.error_line(RuntimeError("x" * 900))), 500)
+        self.assertEqual(len(ckpt.error_line(RuntimeError("x" * 900))), 500)
 
 
 class MetricsHelpers(unittest.TestCase):
@@ -158,21 +159,21 @@ class MetricsHelpers(unittest.TestCase):
 
     def test_labels_come_from_job_env(self):
         env = {"JOB_ID": "3f9a1c2e", "GENERATION": "2", "JOB_COMPLETION_INDEX": "3", "RANK": "3"}
-        self.assertEqual(train.metric_labels(env), {"job_id": "3f9a1c2e", "generation": "2", "rank": "3"})
+        self.assertEqual(ckpt.metric_labels(env), {"job_id": "3f9a1c2e", "generation": "2", "rank": "3"})
 
     def test_phase_is_warmup_until_warmup_steps(self):
-        self.assertEqual(train.phase_of(100, 100), "warmup")
-        self.assertEqual(train.phase_of(101, 100), "steady")
+        self.assertEqual(ckpt.phase_of(100, 100), "warmup")
+        self.assertEqual(ckpt.phase_of(101, 100), "steady")
 
     def test_nccl_kernels_count_as_comm(self):
         class E:
             def __init__(self, name, us):
                 self.name, self.self_device_time_total = name, us
         events = [E("ampere_sgemm_128x64", 600_000), E("ncclDevKernel_AllGather_RING_LL", 300_000), E("elementwise", 20_000)]
-        self.assertEqual(train.split_kernel_seconds(events), (0.62, 0.3))
+        self.assertEqual(ckpt.split_kernel_seconds(events), (0.62, 0.3))
 
     def test_metrics_off_is_a_no_op(self):
-        m = train.Metrics({"job_id": "j", "generation": "1", "rank": "0"}, port=0)
+        m = ckpt.Metrics({"job_id": "j", "generation": "1", "rank": "0"}, port=0)
         self.assertFalse(m.on)
         m.stage("train"); m.step(1, 2.0, 0.5, 0.01, "warmup"); m.checkpoint(1); m.kernels([])  # noqa: E702
 
@@ -193,7 +194,7 @@ class MetricsExport(unittest.TestCase):
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
-        m = train.Metrics({"job_id": "3f9a1c2e", "generation": "1", "rank": "0"}, port=port)
+        m = ckpt.Metrics({"job_id": "3f9a1c2e", "generation": "1", "rank": "0"}, port=port)
         m.stage("checkpoint")
         m.step(5, 2.5, 0.8, 0.02, "steady")
         m.checkpoint(5)

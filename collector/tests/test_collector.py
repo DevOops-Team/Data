@@ -201,6 +201,19 @@ def test_job_progress_failure_reason_reaches_v_job_status(conn, collector_conn):
     assert one(conn, "SELECT error FROM data.job_progress")[0] is None
 
 
+def test_user_cancel_shows_cancelled(conn, collector_conn):
+    """GPU-120 11/18: 감시기 job.cancelled(사용자 중단) → job_runs.end_reason cancelled → v_job_status CANCELLED."""
+    run(collector_conn, [
+        msg("job.submitted", job_id="3f9a1c2e", generation=1, occurred_at="2026-11-18T01:00:00.000Z",
+            payload={"gpus": 2, "strategy": "fsdp"}),
+        msg("job.started", job_id="3f9a1c2e", generation=1, occurred_at="2026-11-18T01:02:00.000Z"),
+        msg("job.cancelled", job_id="3f9a1c2e", generation=1, occurred_at="2026-11-18T02:00:00.000Z",
+            payload={"reason": "user", "requested_at": "2026-11-18T01:59:58Z"}),
+    ])
+    assert one(conn, "SELECT end_reason, ended_at IS NOT NULL FROM data.job_runs") == ("cancelled", True)
+    assert one(conn, "SELECT state FROM data.v_job_status")[0] == "CANCELLED"
+
+
 def test_job_progress_without_step_keeps_event(conn, collector_conn):
     run(collector_conn, [msg("job.progress", job_id="3f9a1c2e", generation=1, payload={"status": "RUNNING"})])
     assert one(conn, "SELECT count(*) FROM data.events WHERE type = 'job.progress'")[0] == 1

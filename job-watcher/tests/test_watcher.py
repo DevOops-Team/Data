@@ -85,6 +85,17 @@ def test_delete_without_relocation_is_stopped(pub):
     assert pub.sent[-1][2]["type"] == "job.stopped"
 
 
+def test_user_stop_then_delete_is_cancelled(pub):
+    w = make(pub)
+    stop = {"devoops/stop-reason": "user", "devoops/stop-requested-at": "2026-11-18T01:59:58Z"}
+    w.on_jobset(ADDED, jobset(ready=1))
+    w.on_jobset(MODIFIED, jobset(ready=1, annotations=stop))                  # Backend가 주석을 단 뒤
+    w.on_jobset(DELETED, jobset(ready=1, annotations=stop, deletion="2026-11-18T02:00:00Z"))   # 삭제
+    end = pub.sent[-1][2]
+    assert (end["type"], end["occurred_at"], end["payload"]["reason"]) == ("job.cancelled", "2026-11-18T02:00:00Z", "user")
+    assert end["event_id"].endswith("-end")
+
+
 def test_failed_then_relocated_delete_sends_nothing_more(pub):
     w = make(pub)
     w.on_jobset(ADDED, jobset(ready=1))

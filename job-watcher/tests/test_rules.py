@@ -64,6 +64,28 @@ def test_deleted_without_relocation_request_is_stopped():
     assert (end.type, end.time_source) == ("job.stopped", "observed")
 
 
+USER_STOP = {"devoops/stop-reason": "user", "devoops/stop-requested-at": "2026-11-18T01:59:58Z"}
+
+
+def test_user_stop_annotation_is_cancelled():
+    s = snapshot(jobset(ready=1, deletion="2026-11-18T02:00:00Z", annotations=USER_STOP), deleted=True)
+    end = plan(s, observed_at=NOW)[-1]
+    assert (end.key, end.type, end.occurred_at) == ("end", "job.cancelled", "2026-11-18T02:00:00Z")
+    assert end.extra == {"reason": "user", "requested_at": "2026-11-18T01:59:58Z"}
+
+
+def test_relocation_wins_over_user_stop_and_other_reasons_are_stopped():
+    rr = relocation("job-3f9a1c2e-g0001", request_id="rec-7c21", action="moveToSpare")
+    s = snapshot(jobset(ready=1, annotations=USER_STOP), deleted=True, relocation=rr)
+    assert plan(s, observed_at=NOW)[-1].type == "job.fenced"                  # 복구가 먼저
+    s = snapshot(jobset(ready=1, annotations={"devoops/stop-reason": "admin"}), deleted=True)
+    assert plan(s, observed_at=NOW)[-1].type == "job.stopped"
+
+
+def test_user_stop_annotation_without_delete_sends_nothing():
+    assert plan(snapshot(jobset(annotations=USER_STOP)), observed_at=NOW) == []
+
+
 def test_completed_or_failed_wins_over_delete():
     rr = relocation("job-3f9a1c2e-g0001")
     s = snapshot(jobset(completed="2026-11-12T02:00:00Z"), deleted=True, relocation=rr)
