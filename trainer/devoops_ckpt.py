@@ -3,9 +3,21 @@
 사용자 train.py는 학습만 하고, 재개 · 저장 규약 · 진행률 · 지표 · 펜싱 STOP · 마지막 승인 대기 · 실패 기록은 여기서 한다.
 trainer 이미지에 들어 있다 (/opt/train, PYTHONPATH). 안 써도 되지만, 그러면 아래 규약을 직접 지켜야 저장 · 재개가 된다.
 
+1) 기본: fit() — 학습 루프까지 시스템이 돈다. 사용자는 모델 · 데이터셋 · loss만
+
     import devoops_ckpt as ckpt
 
-    cfg, cfg_hash = ckpt.load_config()                      # /code/config.json (Backend가 만든 학습 설정)
+    def loss_fn(model, batch):                              # batch는 이미 GPU에
+        return model(input_ids=batch, labels=batch).loss
+
+    ckpt.fit(model=lambda: AutoModelForCausalLM.from_pretrained(...),   # 모듈 또는 만드는 함수
+             dataset=TensorDataset(...),                                # Dataset 또는 만드는 함수
+             loss_fn=loss_fn,
+             optimizer=lambda params: torch.optim.AdamW(params, lr=1e-5))  # 선택, 기본 AdamW(config lr)
+
+2) 루프를 직접 짜야 할 때 (gradient accumulation · 여러 옵티마이저 등): Session
+
+    cfg, cfg_hash = ckpt.load_config()                    # /code/config.json (Backend가 만든 학습 설정)
     dist.init_process_group("nccl")
     ... 모델 · 옵티마이저 · DataLoader (사용자 코드) ...
     with ckpt.Session(mode=cfg.training_mode, total_steps=total, cfg_hash=cfg_hash,
@@ -583,3 +595,172 @@ def _device_of(dist):
     if dist.get_backend() == "nccl":
         return torch.device("cuda", torch.cuda.current_device())
     return torch.device("cpu")
+
+
+# ---------- 루프 소유형: fit() (GPU-209) ----------
+# 사용자는 모델 · 데이터셋 · loss 함수만 준다. 분산 감싸기 · DataLoader · 학습률 · 재개 · 저장 · 진행률 · 지표 ·
+# STOP · 마지막 승인 대기 · 실패 기록은 전부 fit()이 한다. 루프를 직접 짜야 하면(gradient accumulation 등) Session을 쓴다.
+
+def total_steps(steps_per_epoch: int, epochs: int, max_steps: int | None) -> int:
+    total = steps_per_epoch * epochs
+    return min(total, max_steps) if max_steps is not None else total
+
+
+def lr_at(step: int, base: float, warmup: int, total: int) -> float:
+    """기본 학습률: warmup 동안 선형으로 올리고, 그 뒤 cosine으로 base의 10%까지 내린다."""
+    if warmup > 0 and step <= warmup:
+        return base * step / warmup
+    t = (step - warmup) / max(1, total - warmup)
+    return base * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * t)))
+
+
+def wrap_model(mode: str, net, device):
+    """config.training_mode대로 감싼다. FSDP는 모델의 _no_split_modules(HF 트랜스포머 블록) 단위, 없으면 통째로."""
+    gpu = device.type == "cuda"
+    if mode == "ddp":
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        return DDP(net.to(device), device_ids=[device.index] if gpu else None)
+
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+
+    names = set(getattr(net, "_no_split_modules", None) or [])
+    blocks = {type(m) for m in net.modules() if type(m).__name__ in names}
+    policy = ModuleWrapPolicy(blocks) if blocks else None
+    # use_orig_params: 옵티마이저와 체크포인트가 원래 파라미터 이름을 그대로 쓴다
+    return FSDP(net, auto_wrap_policy=policy, device_id=device, use_orig_params=True)
+
+
+def clip_gradients(mode: str, model, max_norm: float) -> None:
+    import torch
+
+    if mode == "ddp":
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+    else:
+        model.clip_grad_norm_(max_norm)  # FSDP는 조각을 모아 전체 노름을 계산한다
+
+
+def to_device(batch, device):
+    """배치(텐서 · tuple · list · dict)를 device로. 원소가 하나인 tuple/list(TensorDataset)는 풀어서 준다."""
+    import torch
+
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device, non_blocking=True)
+    if isinstance(batch, dict):
+        return {k: to_device(v, device) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        moved = [to_device(v, device) for v in batch]
+        return moved[0] if len(moved) == 1 else (tuple(moved) if isinstance(batch, tuple) else moved)
+    return batch
+
+
+def _local_device():
+    import torch
+
+    if torch.cuda.is_available():
+        index = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(index)
+        return torch.device("cuda", index)
+    return torch.device("cpu")
+
+
+def fit(*, model, dataset, loss_fn, optimizer=None, lr_schedule=None, max_grad_norm: float | None = 1.0,
+        collate_fn=None, config: tuple[TrainConfig, str] | None = None, **session_kwargs):
+    """학습 전체를 돈다. 모든 rank에서 같은 인자로 부른다. 감싼 모델을 돌려준다.
+
+    model         nn.Module, 또는 그걸 돌려주는 인자 없는 함수 (함수면 fit 안에서 만들어 실패가 FAILED로 남는다)
+    dataset       torch Dataset, 또는 그걸 돌려주는 인자 없는 함수
+    loss_fn       loss_fn(model, batch) -> loss 텐서. batch는 이미 GPU에 있다 (원소 하나인 tuple은 풀어서)
+    optimizer     optimizer(params) -> Optimizer. 없으면 AdamW(lr=config.learning_rate, weight_decay=0.1)
+    lr_schedule   lr_schedule(step, total) -> lr. 없으면 lr_at(warmup → cosine). None을 돌려주면 그 step은 안 바꿈
+    max_grad_norm gradient clip. None이면 안 함
+    collate_fn    DataLoader에 그대로
+    config        (TrainConfig, cfg_hash). 없으면 load_config() (/code/config.json)
+    session_kwargs Session에 그대로 (ckpt_dir · progress_file · generation · metrics_port · profile_every · env, 테스트용)
+
+    config에서 쓰는 것: training_mode · world_size · seed · batch_size_per_gpu · epochs · max_steps ·
+    learning_rate · warmup_steps · checkpoint_policy
+    """
+    import torch
+    import torch.distributed as dist
+    from torch.utils.data import DataLoader, DistributedSampler
+
+    cfg, cfg_hash = config if config is not None else load_config()
+    own_group = not dist.is_initialized()
+    if own_group:
+        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
+    try:
+        rank, world = dist.get_rank(), dist.get_world_size()
+        # total을 알기 전에 실패해도 FAILED가 남도록 먼저 0으로 연다 (데이터를 읽은 뒤 바로 고친다)
+        with Session(mode=cfg.training_mode, total_steps=0, cfg_hash=cfg_hash, policy=cfg.checkpoint_policy,
+                     warmup_steps=cfg.warmup_steps, **session_kwargs) as s:
+            if world != cfg.world_size:
+                raise SystemExit(f"WORLD_SIZE {world} != config.world_size {cfg.world_size}")
+            device = _local_device()
+            torch.manual_seed(cfg.seed)
+
+            if callable(dataset) and not hasattr(dataset, "__getitem__"):
+                dataset = dataset()
+            if not isinstance(model, torch.nn.Module):
+                model = model()
+
+            sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, seed=cfg.seed, drop_last=True)
+            loader = DataLoader(dataset, batch_size=cfg.batch_size_per_gpu, sampler=sampler, drop_last=True,
+                                collate_fn=collate_fn)
+            steps_per_epoch = len(loader)
+            if steps_per_epoch == 0:
+                raise SystemExit(f"{len(dataset)} samples is less than one batch per GPU "
+                                 f"({cfg.batch_size_per_gpu} x {world})")
+            total = total_steps(steps_per_epoch, cfg.epochs, cfg.max_steps)
+            s.total = total
+            s.progress.write(total_steps=total)
+            if rank == 0:
+                print(f"{cfg.training_mode} x {world}: {len(dataset)} samples, {steps_per_epoch} steps/epoch, "
+                      f"{total} steps", flush=True)
+
+            wrapped = wrap_model(cfg.training_mode, model, device)
+            wrapped.train()
+            opt = (optimizer(wrapped.parameters()) if optimizer is not None
+                   else torch.optim.AdamW(wrapped.parameters(), lr=cfg.learning_rate, weight_decay=0.1))
+            if lr_schedule is None:
+                def lr_schedule(step, n):
+                    return lr_at(step, cfg.learning_rate, cfg.warmup_steps, n)
+
+            start = s.load(wrapped, opt, device)               # 승인본이 있으면 그 step까지
+            epoch, skip = s.data_position(start, steps_per_epoch)
+            step = start
+            mark = time.perf_counter()
+            while step < total:
+                sampler.set_epoch(epoch)                        # 같은 seed · epoch → 같은 순서 (재개해도 이어짐)
+                for batch in loader:
+                    if skip:                                    # 재개한 epoch에서 이미 학습한 배치
+                        skip -= 1
+                        mark = time.perf_counter()
+                        continue
+                    step += 1
+                    lr = lr_schedule(step, total)
+                    if lr is not None:
+                        for group in opt.param_groups:
+                            group["lr"] = lr
+                    data_wait = time.perf_counter() - mark
+                    batch = to_device(batch, device)
+                    opt.zero_grad(set_to_none=True)
+                    loss = loss_fn(wrapped, batch)
+                    loss.backward()
+                    if max_grad_norm is not None:
+                        clip_gradients(cfg.training_mode, wrapped, max_grad_norm)
+                    opt.step()
+
+                    s.report(step, loss, data_wait)             # 진행률 · 지표 · 저장 간격 · 펜싱 STOP
+                    if s.should_save(step):                     # 마지막 step은 항상
+                        s.save(wrapped, opt, step)
+                    mark = time.perf_counter()
+                    if step >= total:
+                        break
+                epoch += 1
+            s.finish()                                          # 마지막 저장이 승인될 때까지 (최대 120초)
+            return wrapped
+    finally:
+        if own_group and dist.is_initialized():
+            dist.destroy_process_group()
