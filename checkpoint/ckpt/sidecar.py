@@ -255,12 +255,16 @@ class Sidecar:
             log("sidecar.transient_skip", error=repr(e))
         self.report_progress()
 
-    def report_progress(self, *, force: bool = False) -> None:
-        """진행률 발행은 업로드 · 승인 결과와 무관하게 매 tick 시도 (실패해도 사이드카는 계속)."""
+    def report_progress(self, *, force: bool = False, final: bool = False) -> None:
+        """진행률 발행은 업로드 · 승인 결과와 무관하게 매 tick 시도 (실패해도 사이드카는 계속).
+        final=True: SIGTERM 종료 때. 아직 RUNNING이면 STOPPED (GPU-231)."""
         if self.progress is None:
             return
         try:
-            self.progress.tick(force=force)
+            if final:
+                self.progress.final()
+            else:
+                self.progress.tick(force=force)
         except Exception as e:  # noqa: BLE001
             log("progress.error", error=repr(e))
 
@@ -309,7 +313,9 @@ def main() -> None:
         if once or sc.stopped:
             break
         time.sleep(poll)
-    sc.report_progress(force=True)   # 마지막 진행률(COMPLETED 등)을 간격과 상관없이 한 번 더
+    # 마지막 진행률(COMPLETED 등)을 간격과 상관없이 한 번 더. SIGTERM이면 trainer는 이미 끝났으므로 RUNNING → STOPPED.
+    # 펜싱 STOP으로 끝날 때는 trainer가 아직 돌 수 있어 그대로 보낸다 (GPU-231)
+    sc.report_progress(force=True, final=stopping)
     publisher.flush(5.0)   # 보내지 못한 사건이 있으면 최대 5초 기다림
     # STOP 후에도 Pod가 끝날 때까지 남아 있으면 되지만, 여기서는 그대로 종료한다.
 

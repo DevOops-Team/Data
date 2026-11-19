@@ -140,3 +140,38 @@ def test_publish_failure_keeps_value_for_retry(setup):
 def test_event_id_rules():
     assert progress_event_id("a", 1, 7, None) == "progress-a-g0001-s00000007"
     assert progress_event_id("a", 1, 7, "FAILED") == "progress-a-g0001-s00000007-failed"
+
+
+# ---------- GPU-231: SIGTERM 종료 때 RUNNING → STOPPED ----------
+def test_final_turns_running_into_stopped(setup):
+    path, pub, clock, rep = setup
+    write(path, step=10, total_steps=100)
+    rep.tick()
+    clock.t += 1
+    write(path, step=12, total_steps=100)                  # 간격 때문에 아직 안 보낸 값
+    assert rep.final() is True
+    ev = pub.sent[-1][2]
+    assert ev["payload"]["status"] == "STOPPED" and ev["payload"]["step"] == 12
+    assert ev["event_id"] == "progress-3f9a1c2e-g0002-s00000012-stopped"
+
+
+def test_final_after_running_already_sent(setup):
+    path, pub, _, rep = setup
+    write(path, step=10, total_steps=100)
+    rep.tick()
+    assert rep.final() is True
+    assert pub.sent[-1][2]["payload"]["status"] == "STOPPED" and len(pub.sent) == 2
+
+
+def test_final_keeps_end_status(setup):
+    path, pub, _, rep = setup
+    write(path, step=100, total_steps=100)
+    rep.tick()
+    path.write_text(json.dumps({"generation": 2, "status": "COMPLETED", "step": 100, "total_steps": 100}))
+    rep.final()
+    assert pub.sent[-1][2]["payload"]["status"] == "COMPLETED"
+
+
+def test_final_without_progress_sends_nothing(setup):
+    _, pub, _, rep = setup
+    assert rep.final() is False and pub.sent == []

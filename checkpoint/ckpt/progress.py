@@ -8,6 +8,10 @@ trainer(rank 0)가 PROGRESS_FILE(/progress/progress.json, 공유 emptyDir)에 �
 
 - 최소 간격 PROGRESS_INTERVAL_SECONDS(30). status가 바뀌면(COMPLETED · FAILED) 간격과 상관없이 바로
 - 사이드카가 끝날 때(SIGTERM) 아직 안 보낸 값이 있으면 한 번 더
+- SIGTERM으로 끝날 때 마지막 상태가 아직 RUNNING이면 STOPPED로 바꿔 보낸다 (GPU-231). native sidecar라
+  trainer가 끝난 뒤에야 SIGTERM을 받으므로, 이때 RUNNING = trainer가 끝 상태를 못 쓰고 끝남(사용자 중단 · 펜싱 삭제 ·
+  강제 종료). 이유는 job.lifecycle 끝 사건이 말한다. trainer가 SIGTERM 처리기로 직접 쓰지 않는 이유: 파이썬 처리기는
+  NCCL 대기 중에는 돌지 못해 종료가 torchrun 유예(30초)까지 늦어질 수 있음 (기본 동작은 즉시 종료)
 - event_id = progress-{작업}-g{세대 4자리}-s{step 8자리}, RUNNING이 아니면 끝에 -{status 소문자}
   → 같은 값을 다시 보내도 수집기가 한 번만 저장. 마지막 step의 COMPLETED는 RUNNING과 다른 사건
 - 발행은 최선 노력: Kafka가 안 돼도 학습 · 체크포인트 승인에 영향 없음
@@ -76,6 +80,19 @@ class ProgressReporter:
             return False
         self._send(cur, mtime)
         return True
+
+    def final(self) -> bool:
+        """사이드카 SIGTERM 종료 때. 마지막 상태가 RUNNING이면 STOPPED로 보내고, 아니면 tick(force=True)과 같다."""
+        read = self._read()
+        if read is not None and read[0] != (self._last_sent or {}):
+            self._pending = read
+        cur = self._pending[0] if self._pending else self._last_sent
+        if cur is None:
+            return False
+        if (cur.get("status") or "RUNNING").upper() == "RUNNING":
+            self._send({**cur, "status": "STOPPED"}, time.time())
+            return True
+        return self.tick(force=True)
 
     def _send(self, cur: dict[str, Any], mtime: float) -> None:
         occurred = (datetime.fromtimestamp(mtime, timezone.utc)

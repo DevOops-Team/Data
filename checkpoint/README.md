@@ -79,6 +79,8 @@ rank 0 사이드카가 승인(OK · ALREADY)하면 `job.lifecycle` 토픽에 `ch
 
 rank 0 사이드카가 trainer가 쓰는 `PROGRESS_FILE`(`/progress/progress.json`)을 읽어 바뀌었을 때 `job.lifecycle`에 `job.progress`를 보낸다 → 수집기가 `data.job_progress`(작업당 1행)에 저장 → Backend가 `data.v_job_status`로 화면에 표시. 진행률 DynamoDB 테이블 · progress-reporter 사이드카를 대신한다 (`ckpt/progress.py`).
 
+- 사이드카가 SIGTERM으로 끝날 때 마지막 상태가 아직 `RUNNING`이면 `STOPPED`로 보낸다 (GPU-231). trainer가 끝 상태를 못 쓰고 끝났다는 뜻(사용자 중단 · 펜싱 삭제 · 강제 종료)이고, 이유는 `job.lifecycle` 끝 사건을 본다. 진행률 상태 값: `RUNNING` · `COMPLETED` · `FAILED` · `STOPPED`
+
 - 환경 변수: `PROGRESS_FILE`(없으면 끔) · `PROGRESS_INTERVAL_SECONDS`(30)
 - 최소 30초 간격, 상태(`RUNNING` → `COMPLETED` · `FAILED`)가 바뀌면 바로, 사이드카 종료(SIGTERM) 때 남은 값 한 번 더
 - `event_id` = `progress-{job}-g{세대 4자리}-s{step 8자리}`, `RUNNING`이 아니면 끝에 `-{status 소문자}`
