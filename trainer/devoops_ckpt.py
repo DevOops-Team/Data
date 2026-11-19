@@ -166,7 +166,10 @@ class ProgressFile:
 STAGES = ("init", "train", "checkpoint", "finalize")
 
 
-STEP_BUCKETS = (0.1, 0.3, 1, 3, 10, 30)  # 초. Monitoring docs/training-metrics.md 3절
+# 초. Monitoring docs/training-metrics.md 3절. SmolLM2(step 약 1.3초) · Qwen 큰 모델(7~23초 추정) 근처에 칸이 2~3개씩
+# 있게 촘촘히 (11/20 이태림 제안 — 옛 0.1 · 0.3 · 1 · 3 · 10 · 30은 1~3초 한 칸에 몰려 p95 · p99가 안 보였음).
+# train_data_wait_seconds도 같은 칸을 씀 (0.1초 넘는지만 보면 됨)
+STEP_BUCKETS = (0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 7.5, 10, 15, 20, 30, 60)
 
 
 PROFILE_EVERY = 25  # N step마다 1 step만 프로파일 (규약 3-1절, 실측 뒤 조정)
