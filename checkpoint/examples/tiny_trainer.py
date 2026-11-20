@@ -27,7 +27,7 @@ from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_di
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
-STOP_EXIT = 75
+STOP_EXIT = 1  # 뜻 없음 (ADR-43). 0이면 JobSet이 Completed로 본다
 
 
 def step_name(s: int) -> str:

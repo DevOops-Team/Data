@@ -60,13 +60,13 @@ gradient accumulation · 옵티마이저 여러 개처럼 `fit()`이 못 하는 
 - 학습 지표 (GPU-96): 모든 rank가 `:8000/metrics`(env `METRICS_PORT`, 0이면 끔)로 8개를 연다 — 이름 · 라벨 · 버킷은 Monitoring 레포 `docs/training-metrics.md`.
   `train_step_seconds`(저장 전까지) · `train_data_wait_seconds` · `train_current_step` · `train_loss`(전체 rank 평균) · `train_stage` · `train_last_checkpoint_step`,
   `train_rank_compute_seconds` · `train_rank_comm_seconds`는 `PROFILE_EVERY`(기본 25) step마다 1 step만 torch.profiler로 (GPU에서만). JobSet: trainer `containerPort: 8000` + Pod `prometheus.io/*` 어노테이션
-- 실패 기록 (GPU-188): `with Session` 안에서 예외로 끝나면 진행률에 `FAILED` + 이유 한 줄 → `v_job_status.progress_error`. STOP(75)은 실패로 안 남김
+- 실패 기록 (GPU-188): `with Session` 안에서 예외로 끝나면 진행률에 `FAILED` + 이유 한 줄 → `v_job_status.progress_error`. 펜싱 STOP은 실패로 안 남김 — 어느 rank든 STOP을 받으면 모든 rank가 같은 step에서 멈추고 진행률 `STOPPED` (GPU-244). 종료 코드 75는 없앰 (ADR-43, 종료 코드 1은 뜻 없음)
 
 ## 확인
 
 - 테스트: `cd trainer && python3 -m unittest test_train.py` (torch 없이 순수 함수만, prometheus_client가 있으면 /metrics 노출까지)
 - 재개 확인: `python3 trainer/examples/resume_check.py` (torch만, CPU · gloo · 2 프로세스) — 공개 API `fit()` 그대로:
-  끊김 없이 6 step = 3 step 저장 → 새로 불러와 3 step, FSDP · DDP 최종 가중치 차이 0 + 마지막 승인 · COMPLETED + loss 예외 → FAILED + 이유 + (Session) STOP 75. torch 2.5.1(이미지와 같음) · 2.15에서 통과
+  끊김 없이 6 step = 3 step 저장 → 새로 불러와 3 step, FSDP · DDP 최종 가중치 차이 0 + 마지막 승인 · COMPLETED + loss 예외 → FAILED + 이유 + (Session) rank 0에만 STOP → 모든 rank Stopped · STOPPED, 마지막 승인 대기 중 STOP도 같음. torch 2.5.1(이미지와 같음) · 2.15에서 통과
 - CI: 이 레포 `.github/workflows/ci.yml` matrix `trainer`. `trainer/`가 바뀐 main push에서 이미지 push → `DEPLOY_IMAGES`에 trainer가 있으면 봇이 Gitops `onprem/platform/backend/overlays/onprem`의 `images:` digest 갱신 → Backend env `TRAINER_IMAGE`
 - **배포 순서**: 새 `train.py`(라이브러리 import)는 라이브러리가 든 trainer 이미지에서만 돈다. 이미지가 먼저 배포된 뒤 새 train.py를 올린다. 옛 train.py(규약 직접 구현)는 새 이미지에서도 그대로 돈다
 - 담당: 김현수 (GPU-154로 Backend 레포에서 이전)

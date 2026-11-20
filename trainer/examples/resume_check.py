@@ -121,17 +121,36 @@ def worker(rank, mode, root, port):
         assert (prog["status"], prog["error"]) == ("FAILED", "ValueError: bad batch"), prog
     dist.barrier()
 
-    # E. 펜싱 STOP(이행 기간): 종료 코드 75, 실패로 안 남김 (Session을 직접 쓰는 사용자도 같은 동작)
+    # E. 펜싱 STOP: STOP 파일은 Pod마다 따로라 rank 0 폴더에만 만든다. 그래도 모든 rank가 같은 step에서 Stopped,
+    #    진행률 STOPPED, 실패로 안 남김 (GPU-244, 11/20 펜싱 시험에서 rank 1이 NCCL 오류로 죽던 것)
+    own = os.path.join(root, f"stop-{rank}")
+    os.makedirs(own, exist_ok=True)
     if rank == 0:
-        open(os.path.join(ckpt_dir, "STOP"), "w").close()
+        open(os.path.join(own, "STOP"), "w").close()
     dist.barrier()
     try:
-        with ckpt.Session(mode=mode, total_steps=TOTAL, ckpt_dir=ckpt_dir, progress_file=os.path.join(root, "progress.json"),
+        with ckpt.Session(mode=mode, total_steps=TOTAL, ckpt_dir=own, progress_file=os.path.join(root, "progress.json"),
                           generation=1, metrics_port=0, env={}) as s:
-            s.report(TOTAL + 1, 0.0)                  # float loss → all_reduce 없음
+            s.report(TOTAL + 1, 0.0)                  # float loss → loss all_reduce 없음, STOP은 모든 rank에서 모음
         raise AssertionError("STOP ignored")
-    except SystemExit as e:
-        assert e.code == ckpt.STOP_EXIT, e.code
+    except ckpt.Stopped as e:
+        assert e.code == 1 and e.step == TOTAL + 1, (e.code, e.step)
+    dist.barrier()
+    if rank == 0:
+        assert progress(root)["status"] == "STOPPED", progress(root)
+
+    # F. 마지막 승인을 기다리는 중 rank 0만 STOP → 모든 rank가 Stopped (승인 대기에서 rank 1만 남지 않게)
+    try:
+        with ckpt.Session(mode=mode, total_steps=TOTAL, ckpt_dir=own, progress_file=os.path.join(root, "progress.json"),
+                          generation=1, metrics_port=0, env={}) as s:
+            s.last_saved = TOTAL                      # .approved 없음 → STOP이 없으면 시간 초과까지 기다릴 상황
+            s.finish(timeout=60)
+        raise AssertionError("STOP ignored while waiting")
+    except ckpt.Stopped as e:
+        assert e.step == TOTAL, e.step
+    dist.barrier()
+    if rank == 0:
+        os.remove(os.path.join(own, "STOP"))
 
     diff = max(float((x - y).abs().max()) for x, y in zip(a, b))
     if rank == 0:
