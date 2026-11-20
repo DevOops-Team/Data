@@ -98,6 +98,13 @@ class Helpers(unittest.TestCase):
                 open(os.path.join(d, name), "w").close()
             self.assertEqual([os.path.basename(p) for p in train.data_files(d)], ["a.jsonl", "b.jsonl"])
 
+    def test_stopped_is_not_a_failure_and_not_exit_zero(self):
+        # GPU-244 · ADR-43: 75 대신 Stopped. 종료 코드는 뜻 없는 1 (0이면 JobSet이 Completed로 봄)
+        e = ckpt.Stopped(513)
+        self.assertIsInstance(e, SystemExit)
+        self.assertEqual((e.code, e.step), (1, 513))
+        self.assertFalse(hasattr(ckpt, "STOP_EXIT"))
+
     def test_wait_approved_sees_the_sidecar_marker(self):
         with tempfile.TemporaryDirectory() as d:
             open(os.path.join(d, "step-00000010.approved"), "w").close()
