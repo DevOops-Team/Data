@@ -209,6 +209,9 @@ class MetricsExport(unittest.TestCase):
             self.assertIn(name, body)
         self.assertIn('train_stage{generation="1",job_id="3f9a1c2e",rank="0",stage="checkpoint"} 1.0', body)
         self.assertIn('train_step_seconds_bucket{generation="1",job_id="3f9a1c2e",le="1.0",phase="steady",rank="0"} 1.0', body)
+        # 데이터 대기는 ms 단위 칸 (WAIT_BUCKETS): 0.02초 → 0.01 칸엔 없고 0.025 칸부터 들어감
+        self.assertIn('train_data_wait_seconds_bucket{generation="1",job_id="3f9a1c2e",le="0.01",phase="steady",rank="0"} 0.0', body)
+        self.assertIn('train_data_wait_seconds_bucket{generation="1",job_id="3f9a1c2e",le="0.025",phase="steady",rank="0"} 1.0', body)
 
 
 if __name__ == "__main__":

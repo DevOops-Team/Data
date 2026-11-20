@@ -168,8 +168,10 @@ STAGES = ("init", "train", "checkpoint", "finalize")
 
 # 초. Monitoring docs/training-metrics.md 3절. SmolLM2(step 약 1.3초) · Qwen 큰 모델(7~23초 추정) 근처에 칸이 2~3개씩
 # 있게 촘촘히 (11/20 이태림 제안 — 옛 0.1 · 0.3 · 1 · 3 · 10 · 30은 1~3초 한 칸에 몰려 p95 · p99가 안 보였음).
-# train_data_wait_seconds도 같은 칸을 씀 (0.1초 넘는지만 보면 됨)
 STEP_BUCKETS = (0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 7.5, 10, 15, 20, 30, 60)
+# train_data_wait_seconds 전용 (11/20 이태림 실측: 평균 0.25ms → STEP_BUCKETS로는 전부 첫 칸이라 0.2초로 늘어도
+# 안 보여 랭크별 대기 비교(노드 쪽 스트래글러)를 못 함). ms ~ 수 초를 촘촘히
+WAIT_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)
 
 
 PROFILE_EVERY = 25  # N step마다 1 step만 프로파일 (규약 3-1절, 실측 뒤 조정)
@@ -218,7 +220,7 @@ class Metrics:
         base = ["job_id", "generation", "rank"]
         self.step_seconds = Histogram("train_step_seconds", "한 step 벽시계 시간", base + ["phase"], buckets=STEP_BUCKETS, registry=r)
         self.data_wait = Histogram("train_data_wait_seconds", "step 시작부터 배치가 GPU에 올라올 때까지", base + ["phase"],
-                                   buckets=STEP_BUCKETS, registry=r)
+                                   buckets=WAIT_BUCKETS, registry=r)
         self.compute = Gauge("train_rank_compute_seconds", "프로파일된 step의 계산 커널 시간 합", base, registry=r)
         self.comm = Gauge("train_rank_comm_seconds", "프로파일된 step의 NCCL 커널 시간 합", base, registry=r)
         self.current_step = Gauge("train_current_step", "완료한 global step", base, registry=r)
