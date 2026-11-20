@@ -91,7 +91,6 @@ s3://<체크포인트 버킷>/
 | `gpu.fault` | 분류기 (모니터링) | 복구 컨트롤러, 수집기 | 노드 |
 | `recovery.action` | 복구 컨트롤러 | 수집기 | 잡 ID |
 | `job.lifecycle` | 잡 상태 감시기, 사이드카 | 수집기 | 잡 ID |
-| `fault.injection` | 장애 주입 도구 | 수집기 | 노드 |
 | `monitoring.log` | 모니터링 | 수집기 | 노드 |
 
 **공통 사건 형식 (envelope)**

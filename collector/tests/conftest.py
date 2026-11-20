@@ -67,6 +67,10 @@ def pg_dsn():
     with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:
         c.execute(sql006)
         c.execute(sql006)                                        # 다시 실행해도 안전한지
+    sql007 = (ROOT / "db" / "007_incident_start.sql").read_text()
+    with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:
+        c.execute(sql007)
+        c.execute(sql007)                                        # 다시 실행해도 안전한지
     yield {"owner": f"{base} user=data_app", "collector": f"{base} user=data_collector",
            "exporter": f"{base} user=postgres_exporter", "backend": f"{base} user=backend_ro"}
     subprocess.run([PG_BIN / "pg_ctl", "-D", data, "-m", "immediate", "stop"], capture_output=True)
@@ -78,7 +82,7 @@ def conn(pg_dsn):
     """결과 확인용 소유자(data_app) 연결. 테이블을 비우고 시작한다."""
     c = psycopg.connect(pg_dsn["owner"], autocommit=True)
     c.execute("TRUNCATE data.events, data.event_rejects, data.results, data.checkpoints, data.job_runs, "
-              "data.experiments, data.job_progress CASCADE")
+              "data.experiments, data.job_progress, data.injections CASCADE")
     yield c
     c.close()
 

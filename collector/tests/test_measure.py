@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
 
@@ -103,3 +104,54 @@ def test_exp_id_from_submit_without_experiment_started(scenario):
     assert out["linked_job_runs"] == 2 and [j["job_id"] for j in out["jobs"]] == ["J"]
     assert scenario.execute("SELECT DISTINCT exp_id FROM data.job_runs WHERE job_id = 'J'").fetchall() == [("e2e-x",)]
     assert measure.run(scenario, "e2e-x")["linked_job_runs"] == 0                 # 다시 돌려도 그대로
+
+
+# ---- 장애 시작: 수동 주입 기록 · 분류기 payload.ts (GPU-239, db/007) ----
+
+def _scenario_without_injection_event(conn):
+    """scenario와 같지만 fault.injected 사건이 없다 (ADR-33: 주입은 CLI 수동, 사건 없음)."""
+    run_row(conn, "J", 1, T("00:00"), T("01:00"), T("20:00"), "fenced")
+    run_row(conn, "J", 2, T("20:30"), T("23:00"), T("40:00"), "completed")
+    ckpt(conn, "J", 1, 400, T("15:00"))
+    for step, at in ((200, "08:00"), (400, "15:00"), (500, "18:30")):
+        event(conn, "job.progress", T(at), job="J", gen=1, payload={"step": step, "step_seconds": 1.2})
+    event(conn, "fault.detected", T("19:30"), job="J", node="n1", payload={"ts": T("19:10"), "dedup_key": "d1"})
+    event(conn, "job.resumed", T("23:00"), job="J", gen=2)
+
+
+def test_manual_injection_record_gives_same_numbers(conn):
+    _scenario_without_injection_event(conn)
+    from collector import injection
+    injection.add(conn.cursor(), at=injection.parse_at("2026-11-17 10:19:00"), node="n1", kind="trainer_kill", job_id="J")
+    rows = conn.execute("SELECT start_source, detect_s, classify_s, recover_s FROM data.v_incidents").fetchall()
+    assert [(r[0], *map(float, r[1:])) for r in rows] == [("manual", 30.0, 30.0, 210.0)]   # 신호는 주입의 감지로만
+    r = measure.compute_job(conn.cursor(), "J")
+    assert (r.incidents, r.detect_s, r.downtime_s) == (1, 30.0, 240.0)
+
+
+def test_natural_fault_starts_at_signal_payload_ts(conn):
+    _scenario_without_injection_event(conn)
+    rows = conn.execute("SELECT start_source, injected_at, detect_s, classify_s, signal_lag_s FROM data.v_incidents").fetchall()
+    assert len(rows) == 1 and rows[0][0] == "signal"
+    assert rows[0][1] == datetime.fromisoformat(T("19:10"))                        # payload.ts (10:19:10 KST)
+    assert [float(x) for x in rows[0][2:]] == [20.0, 20.0, 20.0]                     # 신호 시각 − 원본 시각
+
+
+def test_same_dedup_key_is_one_natural_fault(conn):
+    event(conn, "fault.held", T("05:00"), job="Z", node="n9", payload={"ts": T("04:50"), "dedup_key": "dz"})
+    event(conn, "fault.reclassified", T("05:40"), job="Z", node="n9", payload={"dedup_key": "dz"})
+    event(conn, "fault.detected", T("05:41"), job="Z", node="n9", payload={"ts": T("04:50"), "dedup_key": "dz"})
+    rows = conn.execute("SELECT start_source, detect_s, classify_s FROM data.v_incidents").fetchall()
+    assert [(r[0], float(r[1]), float(r[2])) for r in rows] == [("signal", 10.0, 50.0)]  # held 감지, reclassified 분류
+
+
+def test_injection_cli_add_list_delete(conn):
+    from collector import injection
+    cur = conn.cursor()
+    assert injection.parse_at("2026-11-20 14:03:21").utcoffset().total_seconds() == 9 * 3600   # 시간대 없으면 KST
+    iid = injection.add(cur, at=injection.parse_at("2026-11-20T05:03:21Z"), node=" n1 ", kind="xid", note="79")
+    got = injection.recent(cur)
+    assert [(g["injection_id"], g["node"], g["kind"]) for g in got] == [(iid, "n1", "xid")]
+    with pytest.raises(ValueError):
+        injection.add(cur, at=injection.parse_at("2026-11-20 14:00"), node="n1", kind="bogus")
+    assert injection.delete(cur, iid) and injection.recent(cur) == []
