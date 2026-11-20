@@ -8,6 +8,8 @@
   라벨   devoops/generation · kueue.x-k8s.io/queue-name · (있으면) devoops/job-id
   주석   devoops/recovery-id(재배치 실행기 재제출본에만) · (있으면) devoops/exp-id · devoops/config-sha256
          devoops/stop-reason · devoops/stop-requested-at (Backend 사용자 중단이 지우기 전에 닮, GPU-120 11/18)
+         devoops/restart-reason · devoops/restart-requested-at (Backend 사용자 "다시 시작"이 새 세대 재제출본에 닮,
+         GPU-234 11/20 — 이름은 노찬경 확인 전 제안값)
 
 재배치 요청 RelocationRequest (scheduling.devoops.site, ADR-19): 복구 컨트롤러가 만들고 재배치 실행기가 처리한다.
   spec.jobRef = "training/<옛 JobSet 이름>" · spec.requestId(= recovery_id) · spec.action
@@ -29,6 +31,8 @@ ANN_RECOVERY = "devoops/recovery-id"
 ANN_CONFIG = "devoops/config-sha256"
 ANN_STOP_REASON = "devoops/stop-reason"           # "user" = 사용자 중단 → job.cancelled
 ANN_STOP_AT = "devoops/stop-requested-at"
+ANN_RESTART_REASON = "devoops/restart-reason"     # "user" = 사용자 다시 시작 → job.submitted(새 세대) + job.resumed
+ANN_RESTART_AT = "devoops/restart-requested-at"
 GPU_RESOURCE = "nvidia.com/gpu"
 TRAINER = "trainer"
 
@@ -54,6 +58,8 @@ class Snapshot:
     image_digest: str | None = None
     stop_reason: str | None = None           # 삭제 전에 Backend가 단 중단 사유 (user)
     stop_requested_at: str | None = None
+    restart_reason: str | None = None        # Backend 사용자 "다시 시작"으로 만든 새 세대면 사유 (user)
+    restart_requested_at: str | None = None
     # JobSet status (MultiKueue가 워커에서 복사)
     all_ready: bool = False
     completed_at: str | None = None
@@ -187,6 +193,7 @@ def snapshot(jobset: dict[str, Any], workload: dict[str, Any] | None = None, *,
         exp_id=ann.get(ANN_EXP), recovery_id=ann.get(ANN_RECOVERY), config_sha256=ann.get(ANN_CONFIG),
         image_digest=image_digest(jobset), all_ready=all_ready(jobset),
         stop_reason=ann.get(ANN_STOP_REASON), stop_requested_at=ann.get(ANN_STOP_AT),
+        restart_reason=ann.get(ANN_RESTART_REASON), restart_requested_at=ann.get(ANN_RESTART_AT),
         completed_at=condition_time(jobset, "Completed"), failed_at=condition_time(jobset, "Failed"),
         failed_message=_condition_message(jobset, "Failed"),
         deleted=deleted, deleted_at=meta.get("deletionTimestamp"),

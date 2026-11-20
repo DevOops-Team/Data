@@ -40,6 +40,25 @@ def test_resumed_is_decided_by_recovery_id_not_generation():
     assert ("started", "job.started") in keys_types(plan(s, observed_at=NOW))
 
 
+RESTART = {"devoops/restart-reason": "user", "devoops/restart-requested-at": "2026-11-20T03:00:00Z"}
+
+
+def test_user_restart_sends_submitted_and_resumed_with_reason():
+    s = snapshot(jobset(gen=2, ready=1, annotations=RESTART),
+                 workload("job-3f9a1c2e-g0002", admitted="2026-11-20T03:00:05Z", pods_ready="2026-11-20T03:01:00Z"))
+    out = plan(s, observed_at=NOW)
+    assert ("submitted", "job.submitted") in keys_types(out) and ("started", "job.resumed") in keys_types(out)
+    for p in out:
+        if p.key in ("submitted", "started"):
+            assert p.extra["restart_reason"] == "user"
+            assert p.extra["restart_requested_at"] == "2026-11-20T03:00:00Z"
+
+
+def test_recovery_resubmission_has_no_restart_reason():
+    s = snapshot(jobset(gen=2, ready=1, annotations=REC), workload("job-3f9a1c2e-g0002", pods_ready="2026-11-12T03:01:00Z"))
+    assert all("restart_reason" not in p.extra for p in plan(s, observed_at=NOW))
+
+
 def test_start_falls_back_to_observed_time_without_pods_ready():
     out = plan(snapshot(jobset(ready=1)), observed_at=NOW)
     started = [p for p in out if p.key == "started"][0]
