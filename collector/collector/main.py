@@ -11,7 +11,7 @@ DB 연결 오류면 커밋하지 않고, 읽은 위치를 되감은 뒤 기다�
 
 환경 변수
   KAFKA_BOOTSTRAP (필수, 예 kafka1:9092,kafka2:9092,kafka3:9092) · KAFKA_GROUP(data-collector)
-  KAFKA_TOPICS(gpu.fault,recovery.action,job.lifecycle,fault.injection,monitoring.log)
+  KAFKA_TOPICS(gpu.fault,recovery.action,job.lifecycle,monitoring.log)
   PGHOST · PGPORT · PGDATABASE(gpuf_data) · PGUSER · PGPASSWORD · PGSSLMODE  (libpq 표준)
   BATCH_SIZE(500) · POLL_TIMEOUT_S(1.0) · RETRY_SLEEP_S(5)
 """
@@ -31,7 +31,7 @@ import psycopg
 from .envelope import RejectError, parse
 from .store import DeriveSkip, derive, insert_event, insert_reject
 
-DEFAULT_TOPICS = "gpu.fault,recovery.action,job.lifecycle,fault.injection,monitoring.log"
+DEFAULT_TOPICS = "gpu.fault,recovery.action,job.lifecycle,monitoring.log"   # fault.injection은 안 씀 (ADR-33, GPU-239)
 
 
 def log(event: str, **fields: Any) -> None:

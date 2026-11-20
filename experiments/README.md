@@ -79,7 +79,7 @@ python experiments/submit_job.py --model-dir ~/models/gpt2 --name e2e-fault-2 --
 
 | 값 | 뜻 | 출처 |
 |---|---|---|
-| 감지 시간 (MTTD) | 장애 주입 → 분류기 판정 | `v_incidents` (`fault.injected` → `fault.detected` · `fault.reclassified`) |
+| 감지 시간 (MTTD) | 장애 시작 → 분류기 판정 | `v_incidents` (장애 시작 = 수동 주입 기록 `python -m collector.injection add`, 없으면 분류기 신호 `payload.ts` → `fault.detected` · `fault.reclassified`, GPU-239) |
 | 복구 시간 (MTTR) | 장애 주입 → 새 세대 시작 | `v_incidents` (→ `job.resumed`) |
 | ETTR | 학습이 실제로 돌았던 시간 비율 · 재개까지 걸린 시간 | `job_runs` · `job_progress` · `results` |
 | 날아간 step | 장애 시점 step − 마지막 승인 step | `job_progress.step` · `checkpoints` |

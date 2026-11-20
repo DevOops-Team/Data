@@ -4,11 +4,12 @@
 출력: kafka-console-producer에 그대로 넣을 수 있는 "키|JSON" 한 줄씩.
 
     python3 e2e_events.py --prefix t1 --topic job.lifecycle   > lc.txt
-    python3 e2e_events.py --prefix t1 --topic fault.injection > inj.txt
 
 시나리오 (작업 1개 · 세대 1 → 장애 → 세대 2 재개):
   experiment.started → job.submitted(g1) → job.started(g1) → checkpoint.approved(g1, step 100)
-  → fault.injected → job.fenced(g1) → job.resumed(g2, 다른 클러스터) → experiment.ended
+  → job.fenced(g1) → job.resumed(g2, 다른 클러스터) → experiment.ended
+  장애 주입 시각은 사건이 아니라 수동 기록으로 넣는다 (fault.injection 토픽 안 씀, ADR-33 · GPU-239):
+    python -m collector.injection add --at <주입 시각> --node n-e2e --kind other --job <작업 ID>
   + 같은 checkpoint.approved 한 번 더 (중복 무시 확인) + 필수 필드 없는 사건 1건 (event_rejects 확인)
 
 gpu.fault · recovery.action 토픽은 쓰지 않는다 (복구 컨트롤러가 읽을 수 있어 가짜 장애로 복구가 돌 수 있음).
@@ -54,14 +55,13 @@ def build(prefix: str) -> dict[str, list[tuple[str, dict]]]:
         (job, approved),                                                      # 중복
         (job, {"event_id": f"e2e-{prefix}-bad", "type": "job.started"}),      # 형식 오류
     ]
-    injection = [("n-e2e", ev(5, "fault.injected", 90, {"fault": "e2e"}, job_id=job, node="n-e2e"))]
-    return {"job.lifecycle": lifecycle, "fault.injection": injection}
+    return {"job.lifecycle": lifecycle}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--prefix", required=True, help="시험마다 다르게 (예: t1). 사건 ID · 작업 ID에 붙음")
-    ap.add_argument("--topic", required=True, choices=["job.lifecycle", "fault.injection"])
+    ap.add_argument("--topic", required=True, choices=["job.lifecycle"])
     a = ap.parse_args()
     for key, event in build(a.prefix)[a.topic]:
         print(f"{key}|{json.dumps(event, ensure_ascii=False)}")
