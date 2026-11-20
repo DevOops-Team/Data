@@ -37,7 +37,7 @@ Kafka 토픽의 사건을 읽어 PostgreSQL `gpuf_data`의 `data` 스키마(`db/
 |---|---|
 | `KAFKA_BOOTSTRAP` | (필수) 브로커 목록 `host:port,...` |
 | `KAFKA_GROUP` | `data-collector` |
-| `KAFKA_TOPICS` | `gpu.fault,recovery.action,job.lifecycle,fault.injection,monitoring.log` |
+| `KAFKA_TOPICS` | `gpu.fault,recovery.action,job.lifecycle,monitoring.log` (`fault.injection`은 안 씀 — 주입은 CLI 수동, ADR-33) |
 | `PGHOST` `PGPORT` `PGDATABASE` `PGUSER` `PGPASSWORD` `PGSSLMODE` | libpq 표준. `PGUSER=data_collector` (비밀번호는 Secret으로 주입) |
 
 ### DB 계정 (`db/002_roles.sql`)
@@ -48,7 +48,33 @@ Kafka 토픽의 사건을 읽어 PostgreSQL `gpuf_data`의 `data` 스키마(`db/
 | `postgres_exporter` | `pg_monitor` (통계 읽기만), 데이터 테이블 접근 없음, 연결 3개까지 | 모니터링 (ADR-18) |
 | `backend_ro` (`db/004_backend_role.sql`) | `v_job_status` · `job_runs` · `job_progress` · `checkpoints` 읽기만. `events` 등 사건 원본 · 쓰기 없음. `statement_timeout` 5s, 연결 10개까지 | Backend 화면 (GPU-141) |
 
-적용 순서: `001_init.sql`(data_app) → `002_roles.sql`(postgres) → `003_job_progress.sql`(data_app) → `004_backend_role.sql`(postgres) → `\password backend_ro` → `005_progress_error.sql`(data_app) → `006_incidents_skip_restart.sql`(data_app, 사용자 다시 시작의 `job.resumed`를 `v_incidents` 복구 시각에서 뺌, GPU-234). 005 뒤에는 003을 다시 돌리지 않는다 (뷰 칸 수가 달라 교체 거부).
+적용 순서: `001_init.sql`(data_app) → `002_roles.sql`(postgres) → `003_job_progress.sql`(data_app) → `004_backend_role.sql`(postgres) → `\password backend_ro` → `005_progress_error.sql`(data_app) → `006_incidents_skip_restart.sql`(data_app, 사용자 다시 시작의 `job.resumed`를 `v_incidents` 복구 시각에서 뺌, GPU-234) → `007_incident_start.sql`(data_app, 수동 주입 기록 표 `data.injections` + 장애 시작 출처, GPU-239). 005 뒤에는 003을 다시 돌리지 않는다 (뷰 칸 수가 달라 교체 거부).
+
+### 장애 시작 시각 (측정, GPU-239)
+
+장애 주입은 사람이 CLI로 직접 한다 (ADR-33). `v_incidents`는 장애 1건의 시작(`injected_at`)을 세 곳에서 찾고 출처를 `start_source`에 남긴다.
+
+| 출처 | 언제 | 시작 시각 |
+|---|---|---|
+| `manual` | 기록표의 주입 시각을 `python -m collector.injection add`로 넣었을 때 | 넣은 시각 |
+| `event` | 옛 시험 데이터의 `fault.injected` 사건 | 사건 시각 |
+| `signal` | 주입 기록이 없는 장애 (스팟 회수 등 자연 장애) | 분류기 첫 신호의 `payload.ts`, `dedup_key`마다 1건 |
+
+주입(manual · event) 뒤 같은 노드에서 15분 안에 온 분류기 신호는 그 주입의 감지로 보고 따로 세지 않는다.
+
+```sh
+# 주입 직후 (data_app, libpq 환경 변수). 시간대가 없으면 KST
+python -m collector.injection add --at "2026-11-20 14:03:21" --node ip-172-28-74-75.us-east-2.compute.internal \
+    --kind trainer_kill --job eb497561 --note "rank 1 워커 kill -9"
+python -m collector.injection list
+python -m collector.measure --exp <실험> ...    # 그 뒤 측정
+```
+
+맥에서는 DB에 바로 붙지 못하므로(pg_hba) DB VM에서 SQL로 넣어도 같다:
+
+```sh
+ssh dbvm "sudo -u postgres psql -d gpuf_data -c \"SET ROLE data_app; INSERT INTO data.injections (injected_at, node, job_id, kind, note) VALUES ('2026-11-20 14:03:21+09', 'ip-172-28-74-75.us-east-2.compute.internal', 'eb497561', 'trainer_kill', 'rank 1 kill -9')\""
+```
 
 슈퍼유저로 실행한 뒤 `\password data_collector`, `\password postgres_exporter`로 비밀번호를 지정하고, `pg_hba.conf`에 필요한 주소만 허용한다.
 | `BATCH_SIZE` · `POLL_TIMEOUT_S` · `RETRY_SLEEP_S` | `500` · `1.0` · `5` |

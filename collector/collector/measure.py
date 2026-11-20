@@ -15,8 +15,10 @@
   - lost_steps: 세대가 바뀔 때마다 (옛 세대가 마지막으로 보고한 step − 재개에 쓴 승인 step)의 합.
     마지막 step은 job.progress 사건(최소 30초 간격)이라 실제보다 조금 작을 수 있다
   - wait_s: 첫 제출 → 첫 학습 시작 (큐 대기)
-  - ettr: (할당 − 정지 − 재계산) ÷ 할당. 할당 = 첫 시작 → 마지막 종료, 정지 = 세대가 바뀔 때마다 장애 시작(주입 시각,
-    없으면 옛 세대 종료) → 새 세대 시작, 재계산 = 날아간 step × step 시간. 아직 안 끝난 작업은 비움
+  - ettr: (할당 − 정지 − 재계산) ÷ 할당. 할당 = 첫 시작 → 마지막 종료, 정지 = 세대가 바뀔 때마다 장애 시작
+    → 새 세대 시작, 재계산 = 날아간 step × step 시간. 아직 안 끝난 작업은 비움
+  - 장애 시작(v_incidents.injected_at, db/007): 수동 주입 기록(data.injections, python -m collector.injection add) →
+    옛 fault.injected 사건 → 둘 다 없으면 분류기 첫 신호의 payload.ts (GPU-239). 장애 기록이 없으면 옛 세대 종료부터
 """
 from __future__ import annotations
 
@@ -26,7 +28,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
-CALC_VERSION = "measure-v1 (2026-11-17)"
+CALC_VERSION = "measure-v2 (2026-11-20)"   # v2: 장애 시작 = 수동 기록 · 분류기 payload.ts (db/007, GPU-239)
 
 
 @dataclass
@@ -81,7 +83,7 @@ def compute_job(cur, job_id: str) -> JobResult | None:
             lost_known = False
         else:
             lost += max(0, last - resume)
-        # 정지: 이 세대 교체를 일으킨 장애의 시작(주입 시각) → 새 세대 시작. 장애 기록이 없으면 옛 세대 종료부터
+        # 정지: 이 세대 교체를 일으킨 장애의 시작(v_incidents.injected_at) → 새 세대 시작. 장애 기록이 없으면 옛 세대 종료부터
         fault = [i[0] for i in inc if prev[2] is not None and start_next is not None and prev[2] <= i[0] <= start_next]
         gap = _secs(fault[-1] if fault else prev[3], start_next)
         if gap is not None:
