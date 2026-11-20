@@ -3,12 +3,15 @@
 
 사건 (세대마다 종류별로 최대 1번, key가 event_id 끝부분)
   key        type                          판정                                              occurred_at
-  submitted  job.submitted                 재제출본(주석 devoops/recovery-id 있음)이 보임.     creationTimestamp
+  submitted  job.submitted                 재제출본이 보임 — 복구 재배치(주석 devoops/recovery-id)  creationTimestamp
+                                           또는 사용자 다시 시작(주석 devoops/restart-reason, GPU-234).
                                            첫 제출(세대 1)은 Backend가 이미 보내므로 기본으로 안 보냄
   admitted   job.admitted                  Workload Admitted=True (Kueue 쿼터 확보 · 입장)      조건 lastTransitionTime
   placed     job.placed                    Workload status.clusterName (MultiKueue 배치)       admissionCheck Ready 시각, 없으면 Admitted 시각
   started    job.started   (recovery-id 없음)  Workload PodsReady=True                         조건 lastTransitionTime
-             job.resumed   (recovery-id 있음)  없으면 JobSet replicatedJob 전부 ready            감시기가 본 시각 (time_source=observed)
+             job.resumed   (재제출본)          없으면 JobSet replicatedJob 전부 ready            감시기가 본 시각 (time_source=observed)
+             사용자 다시 시작이면 submitted · resumed payload에 restart_reason · restart_requested_at
+             → 측정(v_incidents)은 이 resumed를 장애 복구로 세지 않는다 (db/006)
   end        job.completed                 JobSet Completed=True                              조건 시각
              job.failed                    JobSet Failed=True                                 조건 시각
              job.fenced                    종료 조건 없이 삭제 + 이 JobSet을 가리키는 RelocationRequest 있음
@@ -50,9 +53,11 @@ def plan(s: Snapshot, *, observed_at: str, emit_first_submitted: bool = False) -
         else:
             out.append(Planned(key, type_, observed_at, "observed", extra))
 
-    resubmitted = bool(s.recovery_id)
+    restarted = bool(s.restart_reason)
+    resubmitted = bool(s.recovery_id) or restarted
+    restart = {"restart_reason": s.restart_reason, "restart_requested_at": s.restart_requested_at} if restarted else {}
     if resubmitted or emit_first_submitted:
-        add("submitted", "job.submitted", s.created_at)
+        add("submitted", "job.submitted", s.created_at, **restart)
     if s.admitted_at is not None:
         add("admitted", "job.admitted", s.admitted_at)
     if s.cluster:
@@ -60,9 +65,9 @@ def plan(s: Snapshot, *, observed_at: str, emit_first_submitted: bool = False) -
 
     start_type = "job.resumed" if resubmitted else "job.started"
     if s.pods_ready_at is not None:
-        add("started", start_type, s.pods_ready_at, basis="workload_pods_ready")
+        add("started", start_type, s.pods_ready_at, basis="workload_pods_ready", **restart)
     elif s.all_ready:
-        add("started", start_type, None, basis="jobset_all_ready")
+        add("started", start_type, None, basis="jobset_all_ready", **restart)
 
     if s.completed_at is not None:
         add("end", "job.completed", s.completed_at)

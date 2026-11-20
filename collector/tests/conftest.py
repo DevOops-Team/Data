@@ -63,6 +63,10 @@ def pg_dsn():
     with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:   # 004 다음, 표 주인으로
         c.execute(sql005)
         c.execute(sql005)                                        # 다시 실행해도 안전한지 (권한 유지 포함)
+    sql006 = (ROOT / "db" / "006_incidents_skip_restart.sql").read_text()
+    with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:
+        c.execute(sql006)
+        c.execute(sql006)                                        # 다시 실행해도 안전한지
     yield {"owner": f"{base} user=data_app", "collector": f"{base} user=data_collector",
            "exporter": f"{base} user=postgres_exporter", "backend": f"{base} user=backend_ro"}
     subprocess.run([PG_BIN / "pg_ctl", "-D", data, "-m", "immediate", "stop"], capture_output=True)
