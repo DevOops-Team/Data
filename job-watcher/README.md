@@ -15,10 +15,10 @@
 
 | type | 판정 | occurred_at |
 |---|---|---|
-| `job.submitted` | **재제출본**(주석 `devoops/recovery-id` 있음)이 보임. 첫 제출은 Backend가 보내므로 안 보냄 (`EMIT_FIRST_SUBMITTED=true`면 보냄) | `creationTimestamp` |
+| `job.submitted` | **재제출본**이 보임 — 복구 재배치(주석 `devoops/recovery-id`) 또는 사용자 다시 시작(주석 `devoops/restart-reason`, payload `restart_reason` · `restart_requested_at`, GPU-234). 첫 제출은 Backend가 보내므로 안 보냄 (`EMIT_FIRST_SUBMITTED=true`면 보냄) | `creationTimestamp` |
 | `job.admitted` | Workload `Admitted=True` (Kueue 입장) | 조건 시각 |
 | `job.placed` | Workload `status.clusterName` (MultiKueue 배치) | admissionCheck Ready 시각 |
-| `job.started` / `job.resumed` | Workload `PodsReady=True`, 없으면 JobSet 전부 ready. `devoops/recovery-id`가 있으면 resumed | 조건 시각, 없으면 본 시각 |
+| `job.started` / `job.resumed` | Workload `PodsReady=True`, 없으면 JobSet 전부 ready. 재제출본(`devoops/recovery-id` 또는 `devoops/restart-reason`)이면 resumed. 사용자 다시 시작의 resumed는 측정 `v_incidents`에서 장애 복구로 세지 않음 (`db/006`) | 조건 시각, 없으면 본 시각 |
 | `job.completed` | JobSet `Completed=True` | 조건 시각 |
 | `job.failed` | JobSet `Failed=True` | 조건 시각 |
 | `job.fenced` | 종료 조건 없이 삭제 + `spec.jobRef`가 이 JobSet인 RelocationRequest 있음. payload `request_id` · `action` | `deletionTimestamp` |

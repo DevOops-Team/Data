@@ -136,6 +136,19 @@ def test_v_incidents_from_collected_events(conn, collector_conn):
     assert [float(x) for x in r] == [5.0, 20.0, 180.0, 2.0]
 
 
+def test_v_incidents_skips_user_restart_resume(conn, collector_conn):
+    """사용자 다시 시작(payload restart_reason)의 job.resumed는 장애 복구 시각으로 세지 않는다 (GPU-234, db/006)."""
+    run(collector_conn, [
+        msg("fault.injected", topic="fault.injection", node="n2", job_id="j2", occurred_at="2026-11-16T11:00:00.000Z"),
+        msg("fault.detected", topic="gpu.fault", node="n2", job_id="j2", occurred_at="2026-11-16T11:00:10.000Z"),
+        msg("job.resumed", job_id="j2", generation=2, occurred_at="2026-11-16T11:01:00.000Z",
+            payload={"restart_reason": "user"}),
+        msg("job.resumed", job_id="j2", generation=3, occurred_at="2026-11-16T11:04:10.000Z"),
+    ])
+    r = one(conn, "SELECT recover_s FROM data.v_incidents WHERE job_id = 'j2'")
+    assert float(r[0]) == 240.0
+
+
 def test_new_generation_inherits_from_previous(conn, collector_conn):
     """복구로 생긴 세대(job.submitted 없이 job.resumed만 옴)는 이전 세대 값을 이어받는다. queue · cluster는 제외."""
     env1 = {"job_id": "j-inh", "generation": 1, "cluster": "eks-a"}
