@@ -36,7 +36,8 @@ class Sidecar:
     def __init__(self, cfg: Config, fencing: FencingTable, store: Store, *,
                  rank_wait_seconds: float | None = None, keep_local: int | None = None,
                  heartbeat_seconds: float | None = None, image_digest: str | None = None,
-                 publisher: events.Publisher | None = None, progress: ProgressReporter | None = None):
+                 publisher: events.Publisher | None = None, progress: ProgressReporter | None = None,
+                 approve_blocked_warn_seconds: float | None = None):
         self.cfg, self.fencing, self.store = cfg, fencing, store
         self.publisher = publisher or events.NullPublisher()
         self.progress = progress
@@ -48,6 +49,11 @@ class Sidecar:
         self.image_digest = image_digest or os.environ.get("IMAGE_DIGEST")
         self._last_hb = 0.0
         self._waiting_since: dict[int, float] = {}
+        # 복구 중(RECOVERING)으로 승인이 막힌 시간 (GPU-228). 복구가 중간 단계에서 HOLD로 멈추면 계속 막힌다
+        self.blocked_warn = (approve_blocked_warn_seconds if approve_blocked_warn_seconds is not None
+                             else float(os.environ.get("APPROVE_BLOCKED_WARN_SECONDS", "600")))
+        self._recovering_since: float | None = None
+        self._blocked_warned_at: float | None = None
         self.stopped = False
 
     # ---------- 공통 ----------
@@ -131,11 +137,44 @@ class Sidecar:
         res = self.fencing.approve(cfg.job_id, cfg.generation, cfg.cluster, step)
         log("sidecar.approve", step=step, result=res.value)
         if res in (ApproveResult.OK, ApproveResult.ALREADY):
+            self._clear_recovering(step)
             layout.approved_marker(cfg.ckpt_dir, step).touch()
             self._publish_approved(step, manifest)
         elif res in (ApproveResult.FENCED, ApproveResult.NO_ITEM):
             self.stop("approve_" + res.value, step=step)
-        # STALE: 늦은 요청이라 건너뜀. RECOVERING: 다음 tick에 다시 시도
+        elif res is ApproveResult.RECOVERING:
+            self._note_recovering(step)   # 다음 tick에 다시 시도, 오래 막히면 로그
+        # STALE: 늦은 요청이라 건너뜀
+
+    def _note_recovering(self, step: int, now: float | None = None) -> None:
+        """RECOVERING이 이어진 시간이 기준을 넘으면 sidecar.approve_blocked (이후 같은 간격마다 반복).
+        Loki에서 이 로그로 알림을 걸 수 있다. 원인(HOLD 사유)은 복구 컨트롤러 기록과 job_id · generation으로 묶는다."""
+        now = time.monotonic() if now is None else now
+        if self._recovering_since is None:
+            self._recovering_since = now
+        blocked = now - self._recovering_since
+        if blocked < self.blocked_warn:
+            return
+        if self._blocked_warned_at is not None and now - self._blocked_warned_at < self.blocked_warn:
+            return
+        self._blocked_warned_at = now
+        try:
+            item = self.fencing.get(self.cfg.job_id)
+        except Exception as e:  # noqa: BLE001 — 알림용 조회 실패는 로그만
+            item = None
+            log("sidecar.approve_blocked_lookup_failed", error=repr(e))
+        log("sidecar.approve_blocked", job_id=self.cfg.job_id, generation=self.cfg.generation, step=step,
+            blocked_s=int(blocked), recovery_phase=item.recovery_phase if item else None,
+            recovery_id=item.recovery_id if item else None)
+
+    def _clear_recovering(self, step: int, now: float | None = None) -> None:
+        if self._recovering_since is None:
+            return
+        now = time.monotonic() if now is None else now
+        if self._blocked_warned_at is not None:
+            log("sidecar.approve_unblocked", job_id=self.cfg.job_id, generation=self.cfg.generation, step=step,
+                blocked_s=int(now - self._recovering_since))
+        self._recovering_since = self._blocked_warned_at = None
 
     def _publish_approved(self, step: int, manifest: dict) -> None:
         """checkpoint.approved → 수집기가 data.checkpoints에 저장. 실패해도 승인 흐름에는 영향 없음."""
@@ -216,12 +255,16 @@ class Sidecar:
             log("sidecar.transient_skip", error=repr(e))
         self.report_progress()
 
-    def report_progress(self, *, force: bool = False) -> None:
-        """진행률 발행은 업로드 · 승인 결과와 무관하게 매 tick 시도 (실패해도 사이드카는 계속)."""
+    def report_progress(self, *, force: bool = False, final: bool = False) -> None:
+        """진행률 발행은 업로드 · 승인 결과와 무관하게 매 tick 시도 (실패해도 사이드카는 계속).
+        final=True: SIGTERM 종료 때. 아직 RUNNING이면 STOPPED (GPU-231)."""
         if self.progress is None:
             return
         try:
-            self.progress.tick(force=force)
+            if final:
+                self.progress.final()
+            else:
+                self.progress.tick(force=force)
         except Exception as e:  # noqa: BLE001
             log("progress.error", error=repr(e))
 
@@ -270,7 +313,9 @@ def main() -> None:
         if once or sc.stopped:
             break
         time.sleep(poll)
-    sc.report_progress(force=True)   # 마지막 진행률(COMPLETED 등)을 간격과 상관없이 한 번 더
+    # 마지막 진행률(COMPLETED 등)을 간격과 상관없이 한 번 더. SIGTERM이면 trainer는 이미 끝났으므로 RUNNING → STOPPED.
+    # 펜싱 STOP으로 끝날 때는 trainer가 아직 돌 수 있어 그대로 보낸다 (GPU-231)
+    sc.report_progress(force=True, final=stopping)
     publisher.flush(5.0)   # 보내지 못한 사건이 있으면 최대 5초 기다림
     # STOP 후에도 Pod가 끝날 때까지 남아 있으면 되지만, 여기서는 그대로 종료한다.
 

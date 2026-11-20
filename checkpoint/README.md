@@ -54,6 +54,8 @@ S3 · DynamoDB 주소는 boto3 표준 `AWS_ENDPOINT_URL`로 바꾼다(로컬만)
 
 사이드카 추가 환경 변수: `RANK_WAIT_SECONDS`(300) · `KEEP_LOCAL`(2) · `HEARTBEAT_SECONDS`(10) · `POLL_SECONDS`(2) · `IMAGE_DIGEST`
 
+승인 막힘 로그 (GPU-228): rank 0이 복구 중(`RECOVERING`, 펜싱 테이블 `recovery_phase`가 승인 불가 값)으로 승인을 못 하는 시간이 `APPROVE_BLOCKED_WARN_SECONDS`(600)를 넘으면 `sidecar.approve_blocked`(`job_id` · `generation` · `step` · `blocked_s` · `recovery_phase` · `recovery_id`)를 남기고 같은 간격마다 반복, 승인되면 `sidecar.approve_unblocked`. 복구가 중간 단계에서 HOLD로 멈춰 학습은 도는데 승인이 안 느는 경우를 드러내려는 것 — Loki에서 이 로그로 알림을 걸 수 있다.
+
 생존 파일 (ADR-44, GPU-213): 메인 루프가 한 바퀴 돌 때마다 `ALIVE_FILE`(기본 `/tmp/sidecar-alive`, 빈 값이면 끔)의 시각을 갱신한다. 별도 스레드가 아니라 루프 안이라, 사이드카가 멈추면(hang) 시각도 멈춘다. jobspec의 exec liveness probe가 이 시각이 300초보다 오래되면 사이드카만 재시작한다 — 업로드 · 승인 상태는 `/ckpt`의 표식 파일(`.uploaded` · `.approved`)에 있어 재시작 뒤 이어서 한다.
 ```yaml
 livenessProbe:
@@ -76,6 +78,8 @@ rank 0 사이드카가 승인(OK · ALREADY)하면 `job.lifecycle` 토픽에 `ch
 ### 진행률 사건 발행 (Kafka `job.progress`, GPU-141)
 
 rank 0 사이드카가 trainer가 쓰는 `PROGRESS_FILE`(`/progress/progress.json`)을 읽어 바뀌었을 때 `job.lifecycle`에 `job.progress`를 보낸다 → 수집기가 `data.job_progress`(작업당 1행)에 저장 → Backend가 `data.v_job_status`로 화면에 표시. 진행률 DynamoDB 테이블 · progress-reporter 사이드카를 대신한다 (`ckpt/progress.py`).
+
+- 사이드카가 SIGTERM으로 끝날 때 마지막 상태가 아직 `RUNNING`이면 `STOPPED`로 보낸다 (GPU-231). trainer가 끝 상태를 못 쓰고 끝났다는 뜻(사용자 중단 · 펜싱 삭제 · 강제 종료)이고, 이유는 `job.lifecycle` 끝 사건을 본다. 진행률 상태 값: `RUNNING` · `COMPLETED` · `FAILED` · `STOPPED`
 
 - 환경 변수: `PROGRESS_FILE`(없으면 끔) · `PROGRESS_INTERVAL_SECONDS`(30)
 - 최소 30초 간격, 상태(`RUNNING` → `COMPLETED` · `FAILED`)가 바뀌면 바로, 사이드카 종료(SIGTERM) 때 남은 값 한 번 더
