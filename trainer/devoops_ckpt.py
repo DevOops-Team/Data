@@ -43,7 +43,9 @@ trainer 이미지에 들어 있다 (/opt/train, PYTHONPATH). 안 써도 되지�
   - 저장: CKPT_DIR/step-XXXXXXXX/에 모든 rank가 쓴 뒤 step-XXXXXXXX.done (빈 파일)을 마지막에
   - 끝: 마지막 저장의 step-XXXXXXXX.approved가 생길 때까지 기다린 뒤 종료
   - 진행률(선택): rank 0이 PROGRESS_FILE에 JSON (step · total_steps · loss · status · error)
-  - 중단(이행 기간): CKPT_DIR/STOP이 생기면 저장 없이 종료 코드 75. 펜싱은 relocator가 옛 JobSet을 지워서도 멈춘다
+  - 중단: 어느 rank든 CKPT_DIR/STOP이 생기면 모든 rank가 같은 step에서 저장 없이 끝낸다 (진행률 STOPPED, 종료 코드 1).
+    종료 코드에는 뜻이 없다 (ADR-43 — 펜싱은 감시기 job.fenced로 알림). 0이 아닌 건 JobSet이 Completed로 보지 않게.
+    펜싱은 relocator가 옛 JobSet을 지워서도 멈춘다
 
 환경 변수 (Backend jobspec이 넣음): TRAIN_CONFIG · CONFIG_SHA256 · CKPT_DIR · PROGRESS_FILE · GENERATION · JOB_ID ·
   METRICS_PORT(8000) · PROFILE_EVERY(25)
@@ -55,7 +57,6 @@ import hashlib
 import json
 import math
 import os
-import sys
 import time
 from dataclasses import dataclass, fields
 
@@ -65,7 +66,12 @@ SCHEMA_VERSION = 2
 CHECKPOINT_FORMATS = {"fsdp": "fsdp-dcp", "ddp": "ddp-pt"}
 
 
-STOP_EXIT = 75  # ckpt-sidecar가 STOP을 썼을 때. 장애로 분류하지 않는다
+class Stopped(SystemExit):
+    """ckpt-sidecar가 STOP을 써서(펜싱) 끝남. 실패로 남기지 않고 진행률 STOPPED. 종료 코드 1 (뜻 없음, ADR-43)."""
+
+    def __init__(self, step: int):
+        super().__init__(1)
+        self.step = step
 
 
 APPROVAL_WAIT_SECONDS = 120
@@ -474,7 +480,9 @@ class Session:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         self._stop_profiler()
-        if exc is not None and not (isinstance(exc, SystemExit) and exc.code == STOP_EXIT):
+        if isinstance(exc, Stopped):
+            self.progress.write(status="STOPPED")
+        elif exc is not None:
             self.progress.write(status="FAILED", error=error_line(exc))
         return False                                            # 예외는 그대로 올려 보낸다 (종료 코드 유지)
 
@@ -544,9 +552,9 @@ class Session:
         self.progress.write(**values)
         if self._prof is not None:
             self._prof.step()
-        if stop_requested(self.ckpt_dir):                       # 이행 기간: 사이드카가 펜싱으로 STOP을 쓰면 바로 멈춤
+        if stop_anywhere(dist, stop_requested(self.ckpt_dir)):   # 펜싱 STOP: 한 rank라도 받으면 모두 같은 step에서 멈춤
             print(f"rank {self.rank}: STOP at step {step}", flush=True)
-            sys.exit(STOP_EXIT)
+            raise Stopped(step)
         self._mark = time.perf_counter()
 
     def should_save(self, step: int) -> bool:
@@ -573,11 +581,12 @@ class Session:
 
         self._stop_profiler()
         self.metrics.stage("finalize")
-        if not wait_approved(self.ckpt_dir, self.last_saved, timeout):
-            if stop_requested(self.ckpt_dir):
-                sys.exit(STOP_EXIT)
+        state = wait_approved_all(dist, self.ckpt_dir, self.last_saved, timeout)
+        if state == "stopped":
+            print(f"rank {self.rank}: STOP while waiting for {step_name(self.last_saved)}", flush=True)
+            raise Stopped(self.last_saved)
+        if state != "approved":
             raise SystemExit(f"{step_name(self.last_saved)} not approved within {timeout:.0f}s")
-        dist.barrier()
         self.progress.write(status="COMPLETED")
 
     def _stop_profiler(self) -> None:
@@ -591,6 +600,40 @@ def _sync() -> None:
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def stop_anywhere(dist, local: bool) -> bool:
+    """이 rank의 STOP 여부를 모든 rank에서 모은다 (MAX). STOP 파일은 Pod마다 따로라
+    rank 0만 멈추면 나머지는 NCCL 오류로 죽는다 (11/20 펜싱 시험, GPU-244)."""
+    import torch
+
+    t = torch.tensor([1.0 if local else 0.0], device=_device_of(dist))
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return t.item() > 0
+
+
+def wait_approved_all(dist, ckpt_dir: str, step: int, timeout: float, poll: float = 2.0) -> str:
+    """마지막 저장을 모든 rank가 같이 기다린다: "approved"(모든 rank에 .approved) · "stopped"(어느 rank든 STOP) ·
+    "timeout". 매 회 all_reduce로 판단을 맞춰서 모든 rank가 같은 결과로 끝난다."""
+    import torch
+
+    marker = os.path.join(ckpt_dir, step_name(step) + ".approved")
+    deadline = time.monotonic() + timeout
+    device = _device_of(dist)
+    while True:
+        t = torch.tensor([0.0 if os.path.exists(marker) else 1.0,          # 아직 안 된 rank가 있나
+                          1.0 if stop_requested(ckpt_dir) else 0.0,         # STOP 받은 rank가 있나
+                          1.0 if time.monotonic() >= deadline else 0.0],   # 시간 다 된 rank가 있나
+                         device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        pending, stop, late = (v > 0 for v in t.tolist())
+        if stop:
+            return "stopped"
+        if not pending:
+            return "approved"
+        if late:
+            return "timeout"
+        time.sleep(poll)
 
 
 def _device_of(dist):

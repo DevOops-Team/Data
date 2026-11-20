@@ -29,7 +29,6 @@ from .progress import ProgressReporter
 from .retry import is_transient
 from .storage import Store
 
-STOP_EXIT_CODE = 75  # trainer가 STOP을 보고 쓰는 종료 코드 (노찬경 합의)
 
 
 class Sidecar:
