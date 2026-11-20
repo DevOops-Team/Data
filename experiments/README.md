@@ -9,11 +9,11 @@
 
 | 파일 | 용도 | 내용 |
 |---|---|---|
-| `scenarios/demo-single.csv` | 시연 · 장애 실험 1회 | 작업 1개, FSDP 2장, 1000 step (≈ 20분) |
+| `scenarios/demo-single.csv` | 시연 · 장애 실험 1회 | 작업 1개, FSDP 2장, 1000 step (≈ 27분) |
 | `scenarios/mixed-now.csv` | 스케줄링 부하 (지금 용량) | 15분 동안 8개, 1 · 2장 |
 | `scenarios/mixed-target.csv` | 스케줄링 부하 (목표 용량 EKS 3 × (4+1)) | 30분 동안 14개, 4장 작업 포함 |
 
-길이 근거: 11/12 E2E job `4734d7ac`(gpt2, FSDP 2장)이 step당 약 1.22초 (845초 간격에 694 step).
+길이 근거 (실행 시간 칸 = step × 1.6초, kind(KWOK) 흉내용): 11/20 EKS SmolLM2-135M + wikitext-2, 시작 → 완료 벽시계(체크포인트 저장 · 승인 포함) — `eb497561` FSDP 2장 3100 step 5217초(1.68초), `2c512e82` 2장 1.54초, `f8f6afef` FSDP 4장 1550 step 2493초(1.61초). 순수 step 시간은 p50 1.25초(이태림 지표). 1장은 아직 실측 없음(같은 값으로 둠). 체크포인트 승인 간격 약 10.8분(약 390 step), 첫 승인까지 약 11분. 옛 근거(gpt2, step당 1.22초)는 11/12 `4734d7ac`.
 
 ```bash
 python submit.py experiments/scenarios/demo-single.csv --exp-id exp-a-ours-xid79-r1 \
@@ -33,7 +33,7 @@ python experiments/submit_job.py --model-dir ~/models/gpt2 --name e2e-fault-2 --
 | 인자 | 기본값 | 뜻 |
 |---|---|---|
 | `--model-dir` | (필수) | Hugging Face 모델 폴더. 받는 방법은 스크립트 맨 위 주석 |
-| `--steps` | 1500 | `max_steps`. gpt2 · FSDP 2장은 step당 약 1.32초 → 1500이면 학습 약 34분 |
+| `--steps` | 1500 | `max_steps`. SmolLM2-135M · FSDP 2장은 저장 포함 step당 약 1.6초 → 1500이면 학습 약 40분 (11/20 실측, gpt2는 약 1.32초) |
 | `--gpus` · `--strategy` · `--batch` | 2 · fsdp · 4 | GPU 수 · 방식 · GPU당 배치 |
 | `--exp-id` | 없음 | 실험 ID. 측정 때 `--exp`로 묶는다 |
 | `--dry-run` | | 데이터만 만들고 spec 출력 |
