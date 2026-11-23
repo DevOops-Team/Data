@@ -297,8 +297,7 @@ def main() -> None:
     fencing = FencingTable(cfg.table, region=cfg.region)
     evidence = None
     if cfg.rank == 0 and os.environ.get("PROGRESS_FILE"):
-        # JOBSET_UID: 이 Pod를 만든 JobSet UID (jobspec 주입, 복구 컨트롤러 new_jobset_uid와 같은 쪽). 없으면 증거를 안 씀
-        evidence = RecoveryEvidence(cfg, fencing, os.environ["PROGRESS_FILE"], os.environ.get("JOBSET_UID") or None)
+        evidence = RecoveryEvidence(cfg, fencing, os.environ["PROGRESS_FILE"])
     sc = Sidecar(cfg, fencing, Store(cfg.bucket, region=cfg.region),
                  publisher=publisher, progress=progress, evidence=evidence)
     poll = float(os.environ.get("POLL_SECONDS", "2"))
