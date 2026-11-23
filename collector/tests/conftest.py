@@ -45,9 +45,11 @@ def pg_dsn():
     with psycopg.connect(admin, autocommit=True) as c:
         c.execute("CREATE ROLE data_app LOGIN")
         c.execute("CREATE DATABASE gpuf_data OWNER data_app")
+        c.execute("CREATE ROLE grafana_ro LOGIN")              # 운영의 대시보드 읽기 계정 (003 · 007 · 008 권한 확인용)
     base = f"host=127.0.0.1 port={port} dbname=gpuf_data"
     with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:
         c.execute("CREATE SCHEMA data")
+        c.execute("GRANT USAGE ON SCHEMA data TO grafana_ro")
         c.execute((ROOT / "db" / "001_init.sql").read_text())   # 실제 적용한 스키마 그대로
     with psycopg.connect(f"{base} user=postgres", autocommit=True) as c:
         c.execute((ROOT / "db" / "002_roles.sql").read_text())
@@ -71,8 +73,13 @@ def pg_dsn():
     with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:
         c.execute(sql007)
         c.execute(sql007)                                        # 다시 실행해도 안전한지
+    sql008 = (ROOT / "db" / "008_recovery_held_view.sql").read_text()
+    with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:
+        c.execute(sql008)
+        c.execute(sql008)                                        # 다시 실행해도 안전한지
     yield {"owner": f"{base} user=data_app", "collector": f"{base} user=data_collector",
-           "exporter": f"{base} user=postgres_exporter", "backend": f"{base} user=backend_ro"}
+           "exporter": f"{base} user=postgres_exporter", "backend": f"{base} user=backend_ro",
+           "grafana": f"{base} user=grafana_ro"}
     subprocess.run([PG_BIN / "pg_ctl", "-D", data, "-m", "immediate", "stop"], capture_output=True)
     shutil.rmtree(tmp, ignore_errors=True)
 
