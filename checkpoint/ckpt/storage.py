@@ -45,6 +45,8 @@ class Store:
         self.bucket = bucket
         self.s3 = client or boto3.client("s3", region_name=region)
         self.retry = retry or RetryPolicy()
+        self.progress = None   # 받은 바이트 콜백 (ckpt-init 다운로드 감시, GPU-263). None이면 안 씀
+        self.watch = None      # DownloadWatch — 있으면 승인본 manifest를 읽은 뒤 전체 크기로 단계 시작
 
     # ---------- 공통 ----------
     def put_json(self, key: str, obj) -> None:
@@ -75,7 +77,10 @@ class Store:
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".part")
         try:
-            self.s3.download_file(self.bucket, key, str(tmp))
+            if self.progress is not None:
+                self.s3.download_file(self.bucket, key, str(tmp), Callback=self.progress)
+            else:
+                self.s3.download_file(self.bucket, key, str(tmp))
         except Exception as e:  # noqa: BLE001
             if is_not_found(e):
                 raise CorruptError(f"파일 없음: {key}") from e
@@ -159,6 +164,8 @@ class Store:
                 raise CorruptError(f"승인본 manifest 없음: {mkey}") from e
             raise
         prefix = layout.s3_step_prefix(job_id, gen, step)
+        if self.watch is not None:
+            self.watch.begin("checkpoint", sum(int(f.get("size_bytes") or 0) for f in manifest["files"]))
         for f in manifest["files"]:
             self.download_with_retry(prefix + f["name"], dest_dir / f["name"], f["sha256"], f["size_bytes"], policy)
         return manifest

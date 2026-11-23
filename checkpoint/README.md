@@ -52,6 +52,18 @@ S3 · DynamoDB 주소는 boto3 표준 `AWS_ENDPOINT_URL`로 바꾼다(로컬만)
 
 재시도 (규약 10절 · 한송이 「장애 복구 규약」 4절과 맞춤): `RETRY_ATTEMPTS`(3) · `RETRY_BACKOFF`(5,10,20초) · `DOWNLOAD_DEADLINE_S`(600, ckpt-init 전체). 연결 오류만 재시도, 손상 · 조건 거부는 재시도 안 함. 사이드카는 연결 오류로 STOP하거나 죽지 않고 다음 사이클에 다시 함. 업로드가 재시도까지 실패하면 그 step만 미승인.
 
+ckpt-init 다운로드 감시 (GPU-263, `ckpt/download_watch.py`): EKS Kueue는 입장 뒤 `waitForPodsReady` 10분 안에 Pod 전부 Ready를 요구하고, 그 안에 다운로드 · 이미지 pull · 시작이 모두 들어간다(GPU-256). 다운로드가 길면 10분 뒤 Kueue가 이유 없이 내리므로, ckpt-init이 받은 바이트(boto3 Callback)를 5초마다 보고 스스로 판단한다. 다운로드 시작 30초(`DOWNLOAD_WARMUP_SECONDS`) 뒤부터 예상 남은 시간 = 남은 바이트 ÷ 지금까지 속도:
+
+| 판정 | 기준 | 동작 |
+|---|---|---|
+| `slow` | 예상 > `DOWNLOAD_BUDGET_S`(420 = Kueue 600 − 이미지 · 시작 여유 180) − init 시작부터 지난 시간 | 경고만: `job.init_slow`(예상 · 속도 · 크기) 한 번, 다운로드 계속 — 시간 안에 끝날 수도 있으므로 죽이지 않음 |
+| `too_slow` | 예상 > `KUEUE_READY_TIMEOUT_S`(600) − 지난 시간 | 실패: `job.init_failed` reason `download_too_slow` — 다운로드만으로 Kueue 한계를 넘어 실패가 확실. Kueue가 10분씩 최대 3번 다시 넣으며 GPU를 잡는 것을 막음 |
+| `stalled` | `DOWNLOAD_STALL_SECONDS`(60) 동안 0바이트 | 실패: reason `download_stalled` (transient) |
+
+- 실패는 감시 스레드가 보고(Kafka · termination-log)한 뒤 프로세스를 끝냄(종료 코드 4). boto3 `download_file`은 블로킹이라 끊을 수 없음
+- 큰 모델을 살리지는 않는다: 다운로드가 Kueue 한계를 넘는 모델은 어차피 실패하고, 그걸 10분 뒤가 아니라 1분 안에 이유와 함께 알린다. 살리려면 Kueue 대기를 늘리고(GPU-256) `KUEUE_READY_TIMEOUT_S` · `DOWNLOAD_BUDGET_S`도 같이 올린다
+- 단계(학습 데이터 · 승인본)마다 속도를 새로 잰다. 재시도로 같은 파일을 다시 받으면 바이트가 두 번 세져 속도가 조금 높게 나올 수 있음(판정이 느슨해지는 쪽)
+
 사이드카 추가 환경 변수: `RANK_WAIT_SECONDS`(300) · `KEEP_LOCAL`(2) · `HEARTBEAT_SECONDS`(10) · `POLL_SECONDS`(2) · `IMAGE_DIGEST`
 
 승인 막힘 로그 (GPU-228): rank 0이 복구 중(`RECOVERING`, 펜싱 테이블 `recovery_phase`가 승인 불가 값)으로 승인을 못 하는 시간이 `APPROVE_BLOCKED_WARN_SECONDS`(600)를 넘으면 `sidecar.approve_blocked`(`job_id` · `generation` · `step` · `blocked_s` · `recovery_phase` · `recovery_id`)를 남기고 같은 간격마다 반복, 승인되면 `sidecar.approve_unblocked`. 복구가 중간 단계에서 HOLD로 멈춰 학습은 도는데 승인이 안 느는 경우를 드러내려는 것 — Loki에서 이 로그로 알림을 걸 수 있다.
