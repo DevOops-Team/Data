@@ -70,6 +70,12 @@ class Snapshot:
     cluster: str | None = None
     placed_at: str | None = None
     pods_ready_at: str | None = None
+    # Kueue가 내림 · 다시 넣음 · 비활성화 (GPU-259). waitForPodsReady 시간 초과(PodsReadyTimeout) · 선점 등
+    evicted_at: str | None = None            # 마지막 Evicted=True 조건 시각 (발생마다 바뀜)
+    evicted_reason: str | None = None
+    evicted_message: str | None = None
+    requeue_count: int | None = None         # status.requeueState.count (Kueue가 다시 넣은 횟수)
+    deactivated: bool = False                # spec.active=false — 다시 넣기 한도를 넘어 Kueue가 멈춤
     # 삭제 · 재배치 요청
     deleted: bool = False
     deleted_at: str | None = None
@@ -97,6 +103,14 @@ def condition_time(obj: dict[str, Any], ctype: str) -> str | None:
     for c in (obj.get("status") or {}).get("conditions") or []:
         if c.get("type") == ctype and str(c.get("status")) == "True":
             return c.get("lastTransitionTime") or ""
+    return None
+
+
+def true_condition(obj: dict[str, Any], ctype: str) -> dict[str, Any] | None:
+    """status.conditions에서 type=ctype · status=True인 조건 전체 (reason · message 포함)."""
+    for c in (obj.get("status") or {}).get("conditions") or []:
+        if c.get("type") == ctype and str(c.get("status")) == "True":
+            return c
     return None
 
 
@@ -208,4 +222,11 @@ def snapshot(jobset: dict[str, Any], workload: dict[str, Any] | None = None, *,
         s.pods_ready_at = condition_time(workload, "PodsReady")
         s.cluster, s.placed_at = workload_cluster(workload)
         s.placed_at = s.placed_at or s.admitted_at
+        ev = true_condition(workload, "Evicted")
+        if ev is not None:
+            s.evicted_at = ev.get("lastTransitionTime") or None
+            s.evicted_reason, s.evicted_message = ev.get("reason"), ev.get("message")
+        count = ((workload.get("status") or {}).get("requeueState") or {}).get("count")
+        s.requeue_count = int(count) if isinstance(count, int) else None
+        s.deactivated = (workload.get("spec") or {}).get("active") is False
     return s
