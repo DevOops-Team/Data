@@ -60,7 +60,9 @@ import os
 import time
 from dataclasses import dataclass, fields
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3          # Backend가 쓰는 최신. 3: finetune(학습 방식 full · qlora) 추가 (GPU-262)
+SCHEMA_VERSIONS = (2, 3)    # 2는 finetune 칸이 없다 = full (배포 순서: 하네스 먼저, Backend 나중)
+FINETUNE_METHODS = ("full", "qlora")
 
 
 CHECKPOINT_FORMATS = {"fsdp": "fsdp-dcp", "ddp": "ddp-pt"}
@@ -93,6 +95,24 @@ class CheckpointPolicy:
 
 
 @dataclass(frozen=True)
+class LoraConfig:
+    r: int
+    alpha: int
+    dropout: float
+    target_modules: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Finetune:
+    """학습 방식 (GPU-262). full = 모든 파라미터 학습, qlora = 4bit 기본 가중치 + LoRA 어댑터만 학습."""
+    method: str
+    lora: LoraConfig | None
+
+
+FULL = Finetune(method="full", lora=None)
+
+
+@dataclass(frozen=True)
 class TrainConfig:  # 기본값 없음: 백엔드가 모든 키를 채운다
     model: str
     training_mode: str
@@ -106,6 +126,28 @@ class TrainConfig:  # 기본값 없음: 백엔드가 모든 키를 채운다
     seed: int
     world_size: int
     checkpoint_policy: CheckpointPolicy
+    finetune: Finetune
+
+
+def parse_finetune(raw) -> Finetune:
+    if not isinstance(raw, dict) or set(raw) != {"method", "lora"}:
+        raise SystemExit("config finetune must be {method, lora}")
+    method = raw["method"]
+    if method not in FINETUNE_METHODS:
+        raise SystemExit(f"config finetune.method must be one of {FINETUNE_METHODS}, got {method}")
+    if method == "full":
+        if raw["lora"] is not None:
+            raise SystemExit("config finetune.lora must be null for full")
+        return FULL
+    lora = raw["lora"]
+    keys = {f.name for f in fields(LoraConfig)}
+    if not isinstance(lora, dict) or set(lora) != keys:
+        raise SystemExit(f"config finetune.lora must have {sorted(keys)}")
+    if not lora["target_modules"] or int(lora["r"]) < 1:
+        raise SystemExit("config finetune.lora needs r >= 1 and target_modules")
+    return Finetune(method=method, lora=LoraConfig(r=int(lora["r"]), alpha=int(lora["alpha"]),
+                                                   dropout=float(lora["dropout"]),
+                                                   target_modules=tuple(lora["target_modules"])))
 
 
 def parse_config(raw: bytes, expected_sha: str | None) -> tuple[TrainConfig, str]:
@@ -114,13 +156,19 @@ def parse_config(raw: bytes, expected_sha: str | None) -> tuple[TrainConfig, str
         raise SystemExit(f"config hash mismatch: {digest} != {expected_sha}")
 
     data = json.loads(raw)
-    if data.pop("schema_version", None) != SCHEMA_VERSION:
-        raise SystemExit(f"config schema_version must be {SCHEMA_VERSION}")
+    version = data.pop("schema_version", None)
+    if version not in SCHEMA_VERSIONS:
+        raise SystemExit(f"config schema_version must be one of {SCHEMA_VERSIONS}, got {version}")
+    if version == 2:
+        if "finetune" in data:
+            raise SystemExit("config schema_version 2 has no finetune")
+        data["finetune"] = {"method": "full", "lora": None}
     names = {f.name for f in fields(TrainConfig)}
     if set(data) != names:  # 오타 · 누락을 조용히 넘기지 않는다
         raise SystemExit(f"config keys: missing {names - set(data)}, unknown {set(data) - names}")
     data["dataset"] = DatasetRef(**data["dataset"])
     data["checkpoint_policy"] = CheckpointPolicy(**data["checkpoint_policy"])
+    data["finetune"] = parse_finetune(data["finetune"])
     cfg = TrainConfig(**data)
     want = CHECKPOINT_FORMATS.get(cfg.training_mode)
     if want is None:  # 다른 방식으로 돌면서 요청한 방식으로 보이는 일을 막는다
@@ -774,6 +822,10 @@ def fit(*, model, dataset, loss_fn, optimizer=None, lr_schedule=None, max_grad_n
                      warmup_steps=cfg.warmup_steps, **session_kwargs) as s:
             if world != cfg.world_size:
                 raise SystemExit(f"WORLD_SIZE {world} != config.world_size {cfg.world_size}")
+            if cfg.finetune.method != "full":   # 화면에서 고른 방식과 다르게 돌지 않게
+                raise SystemExit(f"fit() trains every parameter (full); this train.py does not support "
+                                 f"{cfg.finetune.method}. Use a train.py that reads cfg.finetune "
+                                 f"(trainer/examples/fsdp_lm_train.py)")
             device = _local_device()
             torch.manual_seed(cfg.seed)
 

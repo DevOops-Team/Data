@@ -33,7 +33,16 @@ ckpt.fit(model=load_model, dataset=load_dataset, loss_fn=loss_fn)
 | `max_grad_norm` | | 기본 1.0, None이면 clip 안 함 |
 | `collate_fn` | | DataLoader에 그대로 |
 
-배치 크기 · epoch · max_steps · seed · 학습 방식(fsdp/ddp) · world_size는 config.json(제출 화면 값)에서 온다.
+배치 크기 · epoch · max_steps · seed · 분산 방식(fsdp/ddp) · world_size는 config.json(제출 화면 값)에서 온다.
+`fit()`은 Full fine-tuning만 한다. 제출 화면에서 학습 방식을 QLoRA로 고르면(config `finetune.method = qlora`) 바로 실패하므로, QLoRA는 `cfg.finetune`을 읽는 train.py(아래 예시)로 올린다.
+
+### config.json 학습 방식 (`finetune`, schema 3, GPU-262)
+
+| schema | `finetune` | 뜻 |
+|---|---|---|
+| 2 | 없음 | full (옛 Backend). 하네스는 2 · 3을 모두 받는다 — **배포 순서: trainer 이미지 먼저, Backend 나중** |
+| 3 | `{"method": "full", "lora": null}` | 모든 파라미터 학습 |
+| 3 | `{"method": "qlora", "lora": {"r", "alpha", "dropout", "target_modules"}}` | 4bit 기본 가중치 + LoRA 어댑터만 학습 (값은 Backend 설정 `finetune_methods.qlora.lora`) |
 
 ### 루프를 직접 짤 때: `ckpt.Session`
 
@@ -52,11 +61,11 @@ gradient accumulation · 옵티마이저 여러 개처럼 `fit()`이 못 하는 
 
 ### 예시: `examples/fsdp_lm_train.py` (장애 복구 묶음 공용, GPU-160)
 
-`Session` 직접 루프 하나로 Full fine-tuning(F1 Qwen2.5-0.5B · F2 1.5B)과 QLoRA(Q2 Qwen2.5-14B)를 돌린다. 묶음마다 다른 건 파일 맨 위 「묶음 설정」 상수(`METHOD` · `SHARDING` · `GRAD_ACCUM` · `ACCUM_NO_SYNC`)뿐이다.
+`Session` 직접 루프 하나로 Full fine-tuning(F1 Qwen2.5-0.5B · F2 1.5B)과 QLoRA(Q2 Qwen2.5-14B)를 돌린다. 학습 방식 · LoRA 설정은 config `finetune`(제출 화면)을 따르고, 묶음마다 다른 건 파일 맨 위 「묶음 설정」 상수(`GRAD_ACCUM` · `ACCUM_NO_SYNC`)뿐이다. FSDP 방식은 Full이면 SHARD_GRAD_OP, QLoRA면 FULL_SHARD.
 
 - 공통: FSDP fp16 MixedPrecision(버퍼 fp32) + `ShardedGradScaler`, 기울기 누적, 청크 loss 512, activation checkpointing
-- QLoRA: NF4 + double quant(compute · quant_storage fp16), LoRA r 16 · alpha 32 · 전 선형층, 어댑터를 따로 감싸고 `use_orig_params=False`, `s.model_keys` = 어댑터 이름
-- 묶음: 체크포인트 버킷 `datasets/qwen25-14b-wikitext103/v1/` (권장 제출: gpus 4 · batch 2 · lr 2e-4)
+- QLoRA: NF4 + double quant(compute · quant_storage fp16), LoRA는 config 값(기본 r 16 · alpha 32 · 전 선형층), 어댑터를 따로 감싸고 `use_orig_params=False`, `s.model_keys` = 어댑터 이름
+- 묶음: 체크포인트 버킷 `datasets/qwen25-14b-wikitext103/v1/` (권장 제출: 학습 방식 QLoRA · gpus 4 · batch 2 · lr 2e-4)
 
 - 라이브러리 없이 직접 짜도 된다. 그때는 `devoops_ckpt.py` 맨 위 「규약」(체크포인트 규약 3 · 6 · 7절)을 지켜야 저장 · 재개가 된다
 - 안 지켜도 **안전은 깨지지 않는다**: 옛 세대는 사이드카가 업로드 · 승인 전에 DynamoDB 펜싱으로 막고, relocator가 옛 JobSet을 지워 멈춘다. 재개 · 진행률이 안 될 뿐

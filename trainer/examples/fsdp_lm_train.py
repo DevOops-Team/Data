@@ -1,22 +1,23 @@
 """FSDP causal LM 학습 — 장애 복구 실험 묶음 공용 train.py (GPU-160, 개인 문서 25591809 F1 · F2 · Q2).
 
-이 파일 하나로 Full fine-tuning(F1 0.5B · F2 1.5B)과 QLoRA(Q2 14B)를 모두 돌린다. 묶음마다 다른 것은 아래
-「묶음 설정」 상수뿐이고, 묶음(`datasets/<id>/v<n>/code/train.py`)에 올릴 때 그 값만 바꾼다.
+이 파일 하나로 Full fine-tuning(F1 0.5B · F2 1.5B)과 QLoRA(Q2 14B)를 모두 돌린다. 학습 방식(full · qlora)과
+LoRA 설정은 제출 화면에서 고른 config.json `finetune`을 따른다 (GPU-262). 묶음마다 다른 것은 아래 「묶음 설정」
+상수(FSDP 방식 · 기울기 누적)뿐이고, 묶음(`datasets/<id>/v<n>/code/train.py`)에 올릴 때 그 값만 바꾼다.
 
 trainer 이미지의 하네스 devoops_ckpt(GPU-209)의 Session 위에서 돈다. 이 파일은 모델 · 데이터 · FSDP 설정 ·
 학습 한 step만 정하고, 재개 · 저장 규약 · 진행률 · 지표 · 펜싱 STOP · 마지막 승인 대기 · 실패 기록은 Session이 한다.
 fit()을 쓰지 않는 이유: fit()은 FSDP 기본값(FULL_SHARD · fp32)으로 감싸고 기울기 누적 · QLoRA가 없다.
 
-config.json(Backend 제출 화면)에서 쓰는 것: training_mode(fsdp만) · world_size · seed · batch_size_per_gpu ·
-epochs · max_steps · learning_rate · warmup_steps · checkpoint_policy.
+config.json(Backend 제출 화면)에서 쓰는 것: training_mode(fsdp만) · finetune(method · lora) · world_size · seed ·
+batch_size_per_gpu · epochs · max_steps · learning_rate · warmup_steps · checkpoint_policy.
 config.json에 칸이 없는 설정은 아래 상수다 (Backend · 하네스는 모르는 config 키를 거절한다).
 
 1 step = optimizer step 1번 = 마이크로 배치 GRAD_ACCUM개. 진행률 · 저장 간격 · max_steps도 이 단위다.
 
-QLoRA(METHOD = "qlora")
+QLoRA(config finetune.method = "qlora")
   - 기본 가중치: bitsandbytes NF4 + double quant로 읽는다. compute · quant_storage 모두 fp16
     (T4는 bf16이 없고, FSDP는 한 조각 안의 dtype이 같아야 나눌 수 있다)
-  - 학습: peft LoRA 어댑터만. 어댑터는 fp32로 두고 FSDP MixedPrecision이 fp16으로 계산 · 통신, ShardedGradScaler
+  - 학습: peft LoRA 어댑터만 (r · alpha · dropout · 대상 층은 config finetune.lora). 어댑터는 fp32로 두고 FSDP MixedPrecision이 fp16으로 계산 · 통신, ShardedGradScaler
   - 감싸기: 어댑터(lora_A · lora_B)를 따로 감싸 얼린 조각과 학습 조각을 나눈다 (peft fsdp_auto_wrap_policy와 같은 방식)
   - 저장 · 재개: Session(model_keys=어댑터 이름)이라 체크포인트에는 어댑터 + 옵티마이저만 들어간다.
     기본 가중치는 재개 때도 /data/model에서 다시 읽는다
@@ -36,19 +37,14 @@ import devoops_ckpt as ckpt
 
 # ---------- 묶음 설정 (개인 문서 5절 "후보별 config") ----------
 #                F1 qwen25-0p5b        F2 qwen25-1p5b        Q2 qwen25-14b
-# METHOD         "full"                "full"                "qlora"
-# SHARDING       "SHARD_GRAD_OP"       "SHARD_GRAD_OP"       "FULL_SHARD"
+# 제출 학습 방식   Full                  Full                  QLoRA
 # GRAD_ACCUM     4                     1                     4
 # ACCUM_NO_SYNC  True                  False                 False
 # 권장 제출       batch 6 · lr 2e-5     batch 8 · lr 1e-5     batch 2 · lr 2e-4
-METHOD = "qlora"
-SHARDING = "FULL_SHARD"
 GRAD_ACCUM = 4
 ACCUM_NO_SYNC = False
-LORA_R = 16
-LORA_ALPHA = 32
-LORA_DROPOUT = 0.05
-LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+# FSDP 방식은 학습 방식에 따라: Full은 all-gather 1번 적은 SHARD_GRAD_OP, QLoRA는 4bit라 통신이 작아 FULL_SHARD
+SHARDING = {"full": "SHARD_GRAD_OP", "qlora": "FULL_SHARD"}
 # ----------------------------------------------------------------------
 LOSS_CHUNK_TOKENS = 512      # logits(어휘 15만)를 512토큰씩만 만든다
 MAX_BLOCK_SIZE = 1024
@@ -139,7 +135,7 @@ def load_full(model_dir: str):
     return chunked_lm(lm)
 
 
-def load_qlora(model_dir: str, device):
+def load_qlora(model_dir: str, device, lora_cfg):
     """NF4 4bit 기본 가중치 + LoRA 어댑터. 각 rank가 자기 GPU에 4bit 전체를 올린 뒤 FSDP가 나눈다.
 
     노드 RAM이 16 GiB라 CPU에 전체를 올리지 않는다 (safetensors 조각 단위로 읽어 바로 GPU에서 양자화).
@@ -158,8 +154,8 @@ def load_qlora(model_dir: str, device):
     lm.config.use_cache = False
     # prepare_model_for_kbit_training은 쓰지 않는다: 임베딩 · norm을 fp32로 바꿔 FSDP 조각 dtype이 섞이고 메모리가 2배
     lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    lora = LoraConfig(r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT, target_modules=list(LORA_TARGETS),
-                      bias="none", task_type="CAUSAL_LM")
+    lora = LoraConfig(r=lora_cfg.r, lora_alpha=lora_cfg.alpha, lora_dropout=lora_cfg.dropout,
+                      target_modules=list(lora_cfg.target_modules), bias="none", task_type="CAUSAL_LM")
     lm = get_peft_model(lm, lora).get_base_model()   # LoRA가 주입된 원래 모델 (PeftModel 껍데기는 안 씀)
     for p in lm.parameters():
         if p.requires_grad:
@@ -172,7 +168,7 @@ def trainable_keys(net) -> set[str]:
     return {name for name, p in net.named_parameters() if p.requires_grad}
 
 
-def wrap(net, device):
+def wrap(net, device, method: str):
     import torch
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
@@ -183,9 +179,9 @@ def wrap(net, device):
     blocks = {type(m) for m in net.modules() if type(m).__name__ in names}
     # T4는 bf16이 없다 → fp16 계산 · 통신. 버퍼(RoPE inv_freq)는 fp32 그대로 둔다
     mp = MixedPrecision(param_dtype=torch.float16, reduce_dtype=torch.float16, buffer_dtype=torch.float32)
-    common = dict(device_id=device, mixed_precision=mp, sharding_strategy=ShardingStrategy[SHARDING],
+    common = dict(device_id=device, mixed_precision=mp, sharding_strategy=ShardingStrategy[SHARDING[method]],
                   limit_all_gathers=True, forward_prefetch=True)
-    if METHOD == "full":
+    if method == "full":
         return FSDP(net, auto_wrap_policy=ModuleWrapPolicy(blocks) if blocks else None, use_orig_params=True,
                     **common)
 
@@ -207,11 +203,12 @@ def main():
     from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
     from torch.utils.data import DataLoader, DistributedSampler
 
-    if METHOD not in ("full", "qlora"):
-        raise SystemExit(f"METHOD must be full or qlora, got {METHOD}")
     cfg, cfg_hash = ckpt.load_config()
+    method = cfg.finetune.method
     if cfg.training_mode != "fsdp":
-        raise SystemExit(f"this train.py is FSDP only ({METHOD}, SHARDING={SHARDING}), got {cfg.training_mode}")
+        raise SystemExit(f"this train.py is FSDP only ({method}), got {cfg.training_mode}")
+    if method not in SHARDING:
+        raise SystemExit(f"this train.py supports {sorted(SHARDING)}, got {method}")
     gpu = torch.cuda.is_available()
     dist.init_process_group("nccl" if gpu else "gloo")
     try:
@@ -227,12 +224,12 @@ def main():
                 raise SystemExit(f"WORLD_SIZE {world} != config.world_size {cfg.world_size}")
             torch.manual_seed(cfg.seed)                  # 어댑터 초기값(무작위)이 모든 rank에서 같게
             t0 = time.perf_counter()
-            net = load_full(MODEL_DIR) if METHOD == "full" else load_qlora(MODEL_DIR, device)
-            if METHOD == "qlora":                        # 체크포인트 = 어댑터 + 옵티마이저 (4bit 기본 가중치는 안 넣음)
+            net = load_full(MODEL_DIR) if method == "full" else load_qlora(MODEL_DIR, device, cfg.finetune.lora)
+            if method == "qlora":                        # 체크포인트 = 어댑터 + 옵티마이저 (4bit 기본 가중치는 안 넣음)
                 s.model_keys = frozenset(trainable_keys(net))
             if rank == 0:
                 n_train = sum(p.numel() for p in net.parameters() if p.requires_grad)
-                print(f"{METHOD}: model loaded in {time.perf_counter() - t0:.0f}s, trainable {n_train / 1e6:.1f}M"
+                print(f"{method}: model loaded in {time.perf_counter() - t0:.0f}s, trainable {n_train / 1e6:.1f}M"
                       + (f", max GPU {torch.cuda.max_memory_allocated(device) / 2**30:.1f} GiB" if gpu else ""),
                       flush=True)
 
@@ -247,15 +244,15 @@ def main():
             s.total = total
             s.progress.write(total_steps=total)
             if rank == 0:
-                print(f"fsdp {METHOD} {SHARDING} x {world}: {len(dataset)} blocks, micro batch "
+                print(f"fsdp {method} {SHARDING[method]} x {world}: {len(dataset)} blocks, micro batch "
                       f"{cfg.batch_size_per_gpu} x accum {GRAD_ACCUM}, {steps_per_epoch} steps/epoch, {total} steps",
                       flush=True)
 
-            model = wrap(net, device)
+            model = wrap(net, device, method)
             del net
             model.train()
             params = [p for p in model.parameters() if p.requires_grad]
-            opt = torch.optim.AdamW(params, lr=cfg.learning_rate, weight_decay=0.0 if METHOD == "qlora" else 0.1)
+            opt = torch.optim.AdamW(params, lr=cfg.learning_rate, weight_decay=0.0 if method == "qlora" else 0.1)
             # loss scale은 체크포인트에 없다(Session은 모델 · 옵티마이저만 저장) → 재개 직후 몇 step은 scale을 다시 찾느라 건너뛸 수 있다
             scaler = ShardedGradScaler(enabled=gpu)
             if gpu and rank == 0:
