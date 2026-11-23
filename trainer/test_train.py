@@ -63,6 +63,41 @@ class ParseConfig(unittest.TestCase):
                 ckpt.parse_config(raw({**CONFIG, **change}), None)
 
 
+LORA = {"r": 16, "alpha": 32, "dropout": 0.05, "target_modules": ["q_proj", "v_proj"]}
+
+
+class Finetune(unittest.TestCase):
+    """config schema 3의 학습 방식 (GPU-262). schema 2는 full로 읽는다 (Backend보다 하네스가 먼저 배포)."""
+
+    def v3(self, finetune):
+        return raw({**CONFIG, "schema_version": 3, "finetune": finetune})
+
+    def test_schema_2_is_full(self):
+        cfg, _ = ckpt.parse_config(raw(), None)
+        self.assertEqual(cfg.finetune, ckpt.FULL)
+
+    def test_schema_3_reads_full_and_qlora(self):
+        cfg, _ = ckpt.parse_config(self.v3({"method": "full", "lora": None}), None)
+        self.assertEqual(cfg.finetune.method, "full")
+        cfg, _ = ckpt.parse_config(self.v3({"method": "qlora", "lora": LORA}), None)
+        self.assertEqual(cfg.finetune.method, "qlora")
+        self.assertEqual(cfg.finetune.lora.r, 16)
+        self.assertEqual(cfg.finetune.lora.target_modules, ("q_proj", "v_proj"))
+
+    def test_rejects_bad_finetune(self):
+        for finetune in (None, {"method": "lora", "lora": LORA}, {"method": "qlora", "lora": None},
+                         {"method": "full", "lora": LORA}, {"method": "qlora", "lora": {**LORA, "rank": 8}},
+                         {"method": "qlora", "lora": {**LORA, "target_modules": []}}):
+            with self.subTest(finetune=finetune), self.assertRaises(SystemExit):
+                ckpt.parse_config(self.v3(finetune), None)
+
+    def test_schema_3_needs_finetune_and_schema_2_must_not_have_it(self):
+        with self.assertRaises(SystemExit):
+            ckpt.parse_config(raw({**CONFIG, "schema_version": 3}), None)
+        with self.assertRaises(SystemExit):
+            ckpt.parse_config(raw({**CONFIG, "finetune": {"method": "full", "lora": None}}), None)
+
+
 class CheckpointEvery(unittest.TestCase):
     def test_long_runs_save_more_often_than_short_runs(self):
         # 10000 step × 0.5 s = 5000 s, τ 844 s → 5번, 2000 step마다
