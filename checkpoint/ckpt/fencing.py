@@ -67,6 +67,14 @@ class JobItem:
     def recovery_id(self) -> str | None:
         return self._s("recovery_id")
 
+    @property
+    def new_jobset_name(self) -> str | None:
+        return self._s("new_jobset_name")
+
+    @property
+    def new_jobset_uid(self) -> str | None:
+        return self._s("new_jobset_uid")
+
 
 class FencingTable:
     def __init__(self, table: str, client=None, region: str = "us-east-2"):
