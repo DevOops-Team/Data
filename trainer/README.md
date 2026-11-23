@@ -1,6 +1,7 @@
 # trainer
 
-학습 Pod의 trainer 컨테이너 이미지 `ghcr.io/devoops-team/trainer`는 **학습 환경 + 시스템 라이브러리 `devoops_ckpt`**를 담는다 (torch 2.5.1 · CUDA 12.4 · transformers).
+학습 Pod의 trainer 컨테이너 이미지 `ghcr.io/devoops-team/trainer`는 **학습 환경 + 시스템 라이브러리 `devoops_ckpt`**를 담는다 (torch 2.5.1 · CUDA 12.4 · transformers, QLoRA용 bitsandbytes · peft · accelerate).
+이미지는 하나다: Full fine-tuning · `fit()` 학습과 QLoRA 학습이 같은 이미지에서 돈다 (QLoRA 패키지는 쓰는 train.py만 불러온다, GPU-160).
 `train.py`는 이미지에 없다. 사용자가 제출 화면에서 올리면 Backend가 데이터셋(`datasets/<id>/v1/code/train.py`, manifest에 sha256)에 넣고,
 ckpt-init이 모델 · 데이터와 함께 `/data/code/train.py`로 받아 trainer가 `torchrun /data/code/train.py`로 실행한다.
 
@@ -47,6 +48,15 @@ gradient accumulation · 옵티마이저 여러 개처럼 `fit()`이 못 하는 
 | `s.report(step, loss, data_wait)` | 선택 | 진행률(화면) · 지표(:8000) · 저장 간격 측정 · 펜싱 STOP 확인. **안 부르면 측정 전이라 마지막 step에만 저장** |
 | `s.should_save(step)` · `s.save(model, optimizer, step)` | 저장하려면 | 간격마다 `/ckpt/step-N/` + `.done` → 사이드카가 업로드 · 승인 |
 | `s.finish()` | 권장 | 마지막 저장 `.approved`를 최대 120초 대기 → COMPLETED |
+| `Session(model_keys=...)` · `s.model_keys` | QLoRA | 저장 · 재개할 모델 state_dict 키 (기본 None = 전부). 어댑터 이름만 주면 체크포인트에 4bit 기본 가중치가 안 들어간다. 재개 때 그 키만 읽고, 없는 키가 있으면 실패 |
+
+### 예시: `examples/fsdp_lm_train.py` (장애 복구 묶음 공용, GPU-160)
+
+`Session` 직접 루프 하나로 Full fine-tuning(F1 Qwen2.5-0.5B · F2 1.5B)과 QLoRA(Q2 Qwen2.5-14B)를 돌린다. 묶음마다 다른 건 파일 맨 위 「묶음 설정」 상수(`METHOD` · `SHARDING` · `GRAD_ACCUM` · `ACCUM_NO_SYNC`)뿐이다.
+
+- 공통: FSDP fp16 MixedPrecision(버퍼 fp32) + `ShardedGradScaler`, 기울기 누적, 청크 loss 512, activation checkpointing
+- QLoRA: NF4 + double quant(compute · quant_storage fp16), LoRA r 16 · alpha 32 · 전 선형층, 어댑터를 따로 감싸고 `use_orig_params=False`, `s.model_keys` = 어댑터 이름
+- 묶음: 체크포인트 버킷 `datasets/qwen25-14b-wikitext103/v1/` (권장 제출: gpus 4 · batch 2 · lr 2e-4)
 
 - 라이브러리 없이 직접 짜도 된다. 그때는 `devoops_ckpt.py` 맨 위 「규약」(체크포인트 규약 3 · 6 · 7절)을 지켜야 저장 · 재개가 된다
 - 안 지켜도 **안전은 깨지지 않는다**: 옛 세대는 사이드카가 업로드 · 승인 전에 DynamoDB 펜싱으로 막고, relocator가 옛 JobSet을 지워 멈춘다. 재개 · 진행률이 안 될 뿐

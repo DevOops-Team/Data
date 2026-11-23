@@ -146,6 +146,24 @@ class Resume(unittest.TestCase):
         self.assertEqual(ckpt.resume_position(300, 100), (3, 0))
 
 
+class PickKeys(unittest.TestCase):
+    """Session(model_keys=...): QLoRA는 어댑터만 저장 · 재개한다 (GPU-160)."""
+
+    def test_none_keeps_the_whole_state(self):
+        state = {"a": 1, "b": 2}
+        self.assertIs(ckpt.pick_keys(state, None), state)
+
+    def test_keeps_only_the_given_keys(self):
+        state = {"base.weight": 0, "q.lora_A.weight": 1, "q.lora_B.weight": 2}
+        self.assertEqual(ckpt.pick_keys(state, {"q.lora_B.weight", "q.lora_A.weight"}),
+                         {"q.lora_A.weight": 1, "q.lora_B.weight": 2})
+
+    def test_a_key_missing_from_the_state_fails(self):
+        with self.assertRaises(SystemExit) as e:
+            ckpt.pick_keys({"a": 1}, {"a", "lora_A"})
+        self.assertIn("lora_A", str(e.exception.code))
+
+
 class ErrorLine(unittest.TestCase):
     """GPU-188: 실패 이유 한 줄."""
 
