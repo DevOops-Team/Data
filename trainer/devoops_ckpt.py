@@ -311,7 +311,21 @@ def resume_position(step: int, steps_per_epoch: int) -> tuple[int, int]:
     return step // steps_per_epoch, step % steps_per_epoch
 
 
-def save_fsdp(step, model, optimizer, cfg_hash, step_dir):
+def pick_keys(state: dict, keys) -> dict:
+    """저장 · 재개할 모델 키만 고른다 (QLoRA처럼 학습하는 파라미터만 저장할 때). keys가 None이면 state 그대로.
+
+    없는 키가 있으면 실패한다: 이름이 바뀌어 어댑터가 저장 · 재개에서 조용히 빠지는 일을 막는다.
+    """
+    if keys is None:
+        return state
+    missing = sorted(set(keys) - set(state))
+    if missing:
+        more = f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""
+        raise SystemExit(f"model_keys not in state_dict: {', '.join(missing[:3])}{more}")
+    return {k: state[k] for k in sorted(keys)}
+
+
+def save_fsdp(step, model, optimizer, cfg_hash, step_dir, keys=None):
     # 모든 rank가 자기 조각을 쓴다. 모델 상태가 GPU마다 다르기 때문이다.
     # (torch 2.5.1의 get_state_dict는 조각이 0개인 rank가 있으면 실패해서 FSDP 자체 API를 쓴다)
     import torch.distributed.checkpoint as dcp
@@ -320,7 +334,7 @@ def save_fsdp(step, model, optimizer, cfg_hash, step_dir):
 
     with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
         state = {
-            "model": model.state_dict(),
+            "model": pick_keys(model.state_dict(), keys),  # keys: 학습하는 파라미터만 (QLoRA 어댑터)
             # 옵티마이저는 Adam 모멘트(state)만. param_groups(lr · betas · weight_decay)는 코드 · 스케줄이 정하고,
             # 텐서 없는 목록이라 DCP가 저장 · 불러오기 때 키를 다르게 펼쳐 불러오기가 실패한다
             "optim": {"state": FSDP.optim_state_dict(model, optimizer)["state"]},
@@ -349,8 +363,9 @@ def init_optimizer_state(optimizer) -> None:
     optimizer.zero_grad(set_to_none=True)
 
 
-def load_fsdp(model, optimizer, step_dir) -> tuple[int, str]:
+def load_fsdp(model, optimizer, step_dir, keys=None) -> tuple[int, str]:
     # 저장과 같은 모양의 빈 state를 만들고 DCP가 내 조각을 채운다.
+    # keys가 있으면 그 키만 체크포인트에서 읽고, 나머지(얼린 기본 가중치)는 지금 값을 그대로 다시 넣는다.
     import torch.distributed.checkpoint as dcp
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from torch.distributed.fsdp import StateDictType
@@ -358,45 +373,55 @@ def load_fsdp(model, optimizer, step_dir) -> tuple[int, str]:
     init_optimizer_state(optimizer)
     with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
         current = FSDP.optim_state_dict(model, optimizer)
-        state = {"model": model.state_dict(), "optim": {"state": current["state"]},
+        full = model.state_dict()
+        state = {"model": pick_keys(full, keys), "optim": {"state": current["state"]},
                  "step": 0, "config_sha256": ""}
         dcp.load(state, checkpoint_id=step_dir)
-        model.load_state_dict(state["model"])
+        if keys is None:
+            model.load_state_dict(state["model"])
+        else:
+            full.update(state["model"])
+            # strict=False: 4bit 가중치의 양자화 상태(absmax 등)는 파라미터가 아니라 모듈이 따로 들고 있다
+            missing = set(keys) & set(model.load_state_dict(full, strict=False).missing_keys)
+            if missing:
+                raise SystemExit(f"checkpoint did not fill {sorted(missing)[:3]}")
         osd = {"state": state["optim"]["state"], "param_groups": current["param_groups"]}
         optimizer.load_state_dict(FSDP.optim_state_dict_to_load(model, optimizer, osd))
     return int(state["step"]), str(state["config_sha256"])
 
 
-def load_ddp(model, optimizer, step_dir, device) -> tuple[int, str]:
+def load_ddp(model, optimizer, step_dir, device, keys=None) -> tuple[int, str]:
     # rank 0이 쓴 파일 하나를 모든 rank가 읽는다 (ckpt-init이 manifest의 파일을 Pod마다 다 받아 둔다).
     import torch
 
     state = torch.load(os.path.join(step_dir, "checkpoint.pt"), map_location=device, weights_only=False)
-    model.module.load_state_dict(state["model"])
+    missing = model.module.load_state_dict(state["model"], strict=keys is None).missing_keys
+    if keys is not None and set(keys) & set(missing):
+        raise SystemExit(f"checkpoint did not fill {sorted(set(keys) & set(missing))[:3]}")
     optimizer.load_state_dict(state["optim"])
     return int(state["step"]), str(state["config_sha256"])
 
 
-def load_checkpoint(mode, model, optimizer, step_dir, device, want_step, cfg_hash) -> None:
+def load_checkpoint(mode, model, optimizer, step_dir, device, want_step, cfg_hash, keys=None) -> None:
     """승인본을 불러오고, 안에 적힌 step · 설정 해시가 맞는지 확인한다."""
     if mode == "fsdp":
-        step, sha = load_fsdp(model, optimizer, step_dir)
+        step, sha = load_fsdp(model, optimizer, step_dir, keys)
     else:
-        step, sha = load_ddp(model, optimizer, step_dir, device)
+        step, sha = load_ddp(model, optimizer, step_dir, device, keys)
     if step != want_step:
         raise SystemExit(f"{step_dir} holds step {step}, resume.json says {want_step}")
     if sha and sha != cfg_hash:
         raise SystemExit(f"checkpoint config {sha} != current config {cfg_hash}")
 
 
-def save_ddp(step, model, optimizer, cfg_hash, step_dir, rank):
+def save_ddp(step, model, optimizer, cfg_hash, step_dir, rank, keys=None):
     # 모든 rank의 상태가 같으므로 rank 0만 파일 하나를 쓴다.
     import torch
 
     if rank != 0:
         return
     state = {
-        "model": model.module.state_dict(),
+        "model": pick_keys(model.module.state_dict(), keys),
         "optim": optimizer.state_dict(),
         "step": step,
         "config_sha256": cfg_hash,
@@ -404,7 +429,7 @@ def save_ddp(step, model, optimizer, cfg_hash, step_dir, rank):
     torch.save(state, os.path.join(step_dir, "checkpoint.pt"))
 
 
-def save_checkpoint(mode, step, model, optimizer, cfg_hash, rank, ckpt_dir) -> float:
+def save_checkpoint(mode, step, model, optimizer, cfg_hash, rank, ckpt_dir, keys=None) -> float:
     """CKPT_DIR/step-N/에 쓰고 .done을 마지막에 남긴다. 걸린 초를 돌려준다."""
     import torch.distributed as dist
 
@@ -412,9 +437,9 @@ def save_checkpoint(mode, step, model, optimizer, cfg_hash, rank, ckpt_dir) -> f
     step_dir = os.path.join(ckpt_dir, step_name(step))
     os.makedirs(step_dir, exist_ok=True)
     if mode == "fsdp":
-        save_fsdp(step, model, optimizer, cfg_hash, step_dir)
+        save_fsdp(step, model, optimizer, cfg_hash, step_dir, keys)
     else:
-        save_ddp(step, model, optimizer, cfg_hash, step_dir, rank)
+        save_ddp(step, model, optimizer, cfg_hash, step_dir, rank, keys)
     dist.barrier()  # 모든 조각이 다 쓰인 뒤에만 .done
     with open(step_dir + ".done", "wb"):
         pass
@@ -448,13 +473,15 @@ class Session:
     def __init__(self, *, mode: str, total_steps: int, cfg_hash: str = "", policy: CheckpointPolicy | None = None,
                  warmup_steps: int = 0, ckpt_dir: str | None = None, progress_file: str | None = None,
                  generation: int | None = None, metrics_port: int | None = None, profile_every: int | None = None,
-                 env=None):
+                 model_keys=None, env=None):
         import torch.distributed as dist
 
         env = os.environ if env is None else env
         if mode not in CHECKPOINT_FORMATS:
             raise SystemExit(f"devoops_ckpt supports {sorted(CHECKPOINT_FORMATS)}, got {mode}")
         self.mode, self.total, self.cfg_hash, self.policy = mode, total_steps, cfg_hash, policy
+        # 저장 · 재개할 모델 키 (None = 전부). QLoRA는 학습하는 어댑터 이름만 → 체크포인트에 4bit 기본 가중치가 안 들어간다
+        self.model_keys = None if model_keys is None else frozenset(model_keys)
         self.warmup_steps = warmup_steps
         self.rank, self.world = dist.get_rank(), dist.get_world_size()
         self.ckpt_dir = ckpt_dir or env["CKPT_DIR"]
@@ -493,7 +520,8 @@ class Session:
 
         start, step_dir = read_resume(self.ckpt_dir)
         if start:
-            load_checkpoint(self.mode, model, optimizer, step_dir, device or torch.device("cpu"), start, self.cfg_hash)
+            load_checkpoint(self.mode, model, optimizer, step_dir, device or torch.device("cpu"), start, self.cfg_hash,
+                            self.model_keys)
             self.progress.write(step=start, last_checkpoint_step=start)
             self.metrics.checkpoint(start)
             if self.rank == 0:
@@ -564,7 +592,8 @@ class Session:
     def save(self, model, optimizer, step: int) -> float:
         """CKPT_DIR/step-N/에 저장하고 .done을 남긴다 (모든 rank). 걸린 초."""
         self.metrics.stage("checkpoint")                        # 저장 중 step이 안 오르는 걸 정체로 보지 않게
-        took = save_checkpoint(self.mode, step, model, optimizer, self.cfg_hash, self.rank, self.ckpt_dir)
+        took = save_checkpoint(self.mode, step, model, optimizer, self.cfg_hash, self.rank, self.ckpt_dir,
+                               self.model_keys)
         self.metrics.checkpoint(step)
         self.metrics.stage("train")
         self.last_saved = step

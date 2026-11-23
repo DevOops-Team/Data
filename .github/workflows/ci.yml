@@ -152,6 +152,8 @@ jobs:
             check: |
               # 학습 환경만: torch · transformers가 있고 train.py는 이미지에 없다 (사용자 업로드, /data/code/train.py)
               docker run --rm "$LOCAL" python -c "import torch, transformers, safetensors, sentencepiece, tokenizers; print(torch.__version__, transformers.__version__)"
+              # QLoRA (GPU-160): CUDA 없는 러너라 bitsandbytes는 import · 버전만, peft · accelerate는 transformers와 함께 불러지는지
+              docker run --rm "$LOCAL" python -c "import bitsandbytes, peft, accelerate; from transformers import BitsAndBytesConfig; from peft import LoraConfig, get_peft_model; print(bitsandbytes.__version__, peft.__version__, accelerate.__version__)"
               test "$(docker run --rm "$LOCAL" id -u)" = "1000"
               docker run --rm "$LOCAL" sh -c 'test ! -e /opt/train/train.py'
     env:

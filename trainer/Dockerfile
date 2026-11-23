@@ -13,6 +13,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN pip install "transformers==4.46.3" "safetensors==0.4.5" "sentencepiece==0.2.0" "tokenizers==0.20.3" \
     "prometheus_client==0.21.1"
+# QLoRA (GPU-160): 4bit NF4 로딩(bitsandbytes, quant_storage로 FSDP 샤딩) · LoRA 어댑터(peft) · device_map 로딩(accelerate).
+# 셋 다 torch 2.5.1 · transformers 4.46.3과 같은 시기 버전으로 고정. 기존 train.py(Full · fit())는 이 패키지를 안 쓴다
+RUN pip install "bitsandbytes==0.45.0" "peft==0.13.2" "accelerate==1.1.1"
 # devoops_ckpt가 rank마다 :8000/metrics로 학습 지표를 연다 (GPU-96, Monitoring docs/training-metrics.md)
 EXPOSE 8000
 
