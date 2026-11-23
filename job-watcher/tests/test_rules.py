@@ -115,3 +115,40 @@ def test_completed_or_failed_wins_over_delete():
 
 def test_nothing_yet_for_first_submission():
     assert plan(snapshot(jobset()), observed_at=NOW) == []
+
+
+# ---------- Kueue가 내림 · 비활성화 (GPU-259) ----------
+WL = "job-3f9a1c2e-g0001"
+
+
+def test_pods_ready_timeout_eviction_is_reported_each_time():
+    first = plan(snapshot(jobset(), workload(WL, admitted="2026-11-23T05:00:00Z", cluster="eks-a",
+                                             evicted="2026-11-23T05:10:00Z", requeue_count=1)), observed_at=NOW)
+    ev = [p for p in first if p.type == "job.evicted"]
+    assert [p.key for p in ev] == ["evicted-20261123T051000Z"]
+    assert ev[0].occurred_at == "2026-11-23T05:10:00Z" and ev[0].time_source == "k8s"
+    assert ev[0].extra["reason"] == "PodsReadyTimeout" and ev[0].extra["requeue_count"] == 1
+    assert "PodsReady timeout" in ev[0].extra["message"]
+    # 다시 넣은 뒤 또 시간 초과 → 다른 시각 = 다른 사건
+    second = plan(snapshot(jobset(), workload(WL, admitted="2026-11-23T05:12:00Z", cluster="eks-a",
+                                              evicted="2026-11-23T05:22:00Z", requeue_count=2)), observed_at=NOW)
+    assert [p.key for p in second if p.type == "job.evicted"] == ["evicted-20261123T052200Z"]
+    assert not any(p.key == "end" for p in second)                       # 내림은 종료가 아님
+
+
+def test_deactivated_after_requeue_limit():
+    out = plan(snapshot(jobset(), workload(WL, admitted="2026-11-23T05:00:00Z", evicted="2026-11-23T05:40:00Z",
+                                           evicted_reason="InactiveWorkload", requeue_count=3, active=False)),
+               observed_at=NOW)
+    de = [p for p in out if p.type == "job.deactivated"]
+    assert len(de) == 1 and de[0].key == "deactivated" and de[0].time_source == "observed"
+    assert de[0].extra == {"reason": "InactiveWorkload", "message": f"Exceeded the PodsReady timeout default/{WL}",
+                           "requeue_count": 3}
+
+
+def test_no_eviction_events_on_normal_run_or_after_end():
+    normal = plan(snapshot(jobset(ready=1), workload(WL, admitted="2026-11-23T05:00:00Z", cluster="eks-a",
+                                                     pods_ready="2026-11-23T05:01:00Z")), observed_at=NOW)
+    assert not any(p.type in ("job.evicted", "job.deactivated") for p in normal)
+    done = plan(snapshot(jobset(completed="2026-11-23T06:00:00Z"), workload(WL, active=False)), observed_at=NOW)
+    assert not any(p.type == "job.deactivated" for p in done)            # 이미 끝난 세대는 비활성화 안 보냄

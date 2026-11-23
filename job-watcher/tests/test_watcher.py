@@ -48,6 +48,30 @@ def test_events_pass_collector_envelope(pub):
     assert started["payload"]["gpus"] == 4 and started["payload"]["exp_id"] == "exp-0001"
 
 
+def test_kueue_eviction_cycle_reaches_collector(pub):
+    """GPU-259: 시간 초과로 내림 2번 → 비활성화. 발생마다 한 번씩, 수집기 형식으로."""
+    w = make(pub)
+    w.on_jobset(ADDED, jobset())
+    w.on_workload(ADDED, workload(JS1, admitted="2026-11-23T05:00:00Z", cluster="eks-a"))
+    for at, n in (("2026-11-23T05:10:00Z", 1), ("2026-11-23T05:22:00Z", 2)):
+        w.on_workload(MODIFIED, workload(JS1, admitted="2026-11-23T05:00:00Z", cluster="eks-a",
+                                         evicted=at, requeue_count=n))
+        w.on_workload(MODIFIED, workload(JS1, admitted="2026-11-23T05:00:00Z", cluster="eks-a",
+                                         evicted=at, requeue_count=n))                     # 같은 발생 반복 → 한 번만
+    w.on_workload(MODIFIED, workload(JS1, evicted="2026-11-23T05:34:00Z", evicted_reason="InactiveWorkload",
+                                     requeue_count=3, active=False))
+    got = [(v["type"], v["event_id"]) for _, _, v in pub.sent if v["type"] in ("job.evicted", "job.deactivated")]
+    assert got == [("job.evicted", "job-3f9a1c2e-g0001-evicted-20261123T051000Z"),
+                   ("job.evicted", "job-3f9a1c2e-g0001-evicted-20261123T052200Z"),
+                   ("job.evicted", "job-3f9a1c2e-g0001-evicted-20261123T053400Z"),
+                   ("job.deactivated", "job-3f9a1c2e-g0001-deactivated")]
+    for i, (_, _, v) in enumerate(pub.sent):
+        e = parse(json.dumps(v).encode(), "job.lifecycle", 0, i)
+        assert (e.job_id, e.generation) == ("3f9a1c2e", 1)
+    last = [v for _, _, v in pub.sent if v["type"] == "job.deactivated"][0]
+    assert last["payload"]["requeue_count"] == 3 and last["payload"]["reason"] == "InactiveWorkload"
+
+
 def test_waits_for_all_initial_lists(pub):
     w = Watcher(pub, clock=lambda: NOW)
     w.on_jobset(SYNC, [jobset(ready=1)])
