@@ -35,3 +35,19 @@ def test_exporter_reads_stats_not_data(pg_dsn):
     _denied(pg_dsn["exporter"], "SELECT * FROM data.events")
     _denied(pg_dsn["exporter"], "INSERT INTO data.event_rejects (topic,kafka_partition,kafka_offset,error,raw) "
                                 "VALUES ('t',0,0,'e','')")
+
+
+def test_grafana_reads_hold_view_not_events(pg_dsn, conn):
+    # GPU-252: 대시보드 계정은 HOLD 사건 뷰만 읽고 events 표 전체는 못 읽는다
+    with psycopg.connect(pg_dsn["owner"], autocommit=True) as c:
+        for i, typ in enumerate(("recovery.held", "recovery.started")):
+            c.execute("INSERT INTO data.events (event_id, schema_version, type, topic, occurred_at, job_id, generation, "
+                      "payload, kafka_partition, kafka_offset) VALUES (%s, 1, %s, 'recovery.action', now(), 'j1', 2, "
+                      "%s, 0, %s)", (f"held-test-{i}", typ, '{"reason": "NO_SPARE"}', i))
+    with psycopg.connect(pg_dsn["grafana"], autocommit=True) as c:
+        rows = c.execute("SELECT job_id, generation, payload->>'reason' FROM data.v_recovery_held "
+                         "WHERE event_id LIKE 'held-test-%%'").fetchall()
+        assert rows == [("j1", 2, "NO_SPARE")]
+    _denied(pg_dsn["grafana"], "SELECT * FROM data.events")
+    with psycopg.connect(pg_dsn["owner"], autocommit=True) as c:
+        c.execute("DELETE FROM data.events WHERE event_id LIKE 'held-test-%%'")
