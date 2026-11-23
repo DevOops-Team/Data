@@ -45,8 +45,13 @@ def jobset(job_id: str = "3f9a1c2e", gen: int = 1, *, pods: int = 4, ready: int 
 
 
 def workload(jobset_name: str, *, admitted: str | None = None, cluster: str | None = None,
-             cluster_at: str | None = None, pods_ready: str | None = None) -> dict[str, Any]:
+             cluster_at: str | None = None, pods_ready: str | None = None,
+             evicted: str | None = None, evicted_reason: str = "PodsReadyTimeout",
+             requeue_count: int | None = None, active: bool | None = None) -> dict[str, Any]:
     conditions = []
+    if evicted:
+        conditions.append({"type": "Evicted", "status": "True", "lastTransitionTime": evicted,
+                           "reason": evicted_reason, "message": f"Exceeded the PodsReady timeout default/{jobset_name}"})
     if admitted:
         conditions.append({"type": "QuotaReserved", "status": "True", "lastTransitionTime": admitted})
         conditions.append({"type": "Admitted", "status": "True", "lastTransitionTime": admitted})
@@ -57,8 +62,11 @@ def workload(jobset_name: str, *, admitted: str | None = None, cluster: str | No
         status["clusterName"] = cluster
         status["admissionChecks"] = [{"name": "multikueue", "state": "Ready",
                                       "lastTransitionTime": cluster_at or admitted}]
+    if requeue_count is not None:
+        status["requeueState"] = {"count": requeue_count}
+    spec: dict[str, Any] = {"active": active} if active is not None else {}
     return {
-        "apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "Workload",
+        "apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "Workload", "spec": spec,
         "metadata": {"name": f"jobset-{jobset_name}-abcde", "namespace": "training",
                      "ownerReferences": [{"apiVersion": "jobset.x-k8s.io/v1alpha2", "kind": "JobSet",
                                           "name": jobset_name}]},

@@ -20,6 +20,14 @@
                                            (Backend 사용자 중단, payload: reason · requested_at, 한송이 11/18 동의)
              job.stopped                   종료 조건 없이 삭제 + RelocationRequest 없음 + 중단 주석 없음 (수동 삭제 등)
 
+Kueue가 내림 · 비활성화 (GPU-259, GPU-256 후속) — 종료가 아님. 세대 안에서 Kueue가 같은 세대로 다시 넣는다
+  evicted-<시각>  job.evicted                Workload Evicted=True. reason: PodsReadyTimeout(10분 안에 Pod 전부   조건 lastTransitionTime
+                                             Ready 실패, ckpt-init 다운로드 · 이미지 pull이 길 때) · Preempted 등.
+                                             발생마다 시각이 달라 여러 번 나감. payload reason · message · requeue_count
+  deactivated     job.deactivated            Workload spec.active=false (다시 넣기 한도 backoffLimitCount 초과 등)   감시기가 본 시각
+                                             → 그 뒤 Kueue는 다시 넣지 않음. 이미 끝난(end) 세대면 안 보냄
+  이 사건이 없으면 Kueue가 시간 초과로 내린 작업이 수집기 · 복구 컨트롤러 · 화면에서 "입장 후 조용함"으로만 보인다.
+
 종료(end)는 세대마다 하나: completed · failed · fenced · cancelled · stopped가 같은 key("end")를 쓴다.
 재배치 요청이 있으면 중단 주석이 있어도 fenced (복구가 먼저). 삭제를 놓쳐 재목록에서 발견하면 마지막으로 본
 객체의 주석으로 판정한다 — 주석을 단 수정을 못 봤으면 stopped로 나갈 수 있다.
@@ -32,6 +40,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .model import Snapshot
+
+
+def _compact(ts: str) -> str:
+    """'2026-11-23T05:48:12Z' → '20261123T054812Z' (event_id용, 같은 발생은 같은 값)."""
+    return "".join(ch for ch in ts if ch.isalnum())
 
 
 @dataclass(frozen=True)
@@ -68,6 +81,15 @@ def plan(s: Snapshot, *, observed_at: str, emit_first_submitted: bool = False) -
         add("started", start_type, s.pods_ready_at, basis="workload_pods_ready", **restart)
     elif s.all_ready:
         add("started", start_type, None, basis="jobset_all_ready", **restart)
+
+    # Kueue가 내림 · 비활성화 (GPU-259). 내림은 세대 안에서 여러 번(최대 backoffLimitCount+1) → 발생 시각으로 key
+    if s.evicted_at:
+        add(f"evicted-{_compact(s.evicted_at)}", "job.evicted", s.evicted_at, reason=s.evicted_reason,
+            message=(s.evicted_message or "")[:300] or None, requeue_count=s.requeue_count)
+    ended = s.completed_at is not None or s.failed_at is not None or s.deleted
+    if s.deactivated and not ended:
+        add("deactivated", "job.deactivated", None, reason=s.evicted_reason,
+            message=(s.evicted_message or "")[:300] or None, requeue_count=s.requeue_count)
 
     if s.completed_at is not None:
         add("end", "job.completed", s.completed_at)
