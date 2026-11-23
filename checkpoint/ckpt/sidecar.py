@@ -68,9 +68,10 @@ class Sidecar:
         return self.stop_reason in FENCE_STOP_REASONS
 
     def record_self_fence(self, tries: int = 3, wait: float = 1.0) -> str | None:
-        """trainer가 끝난 뒤(SIGTERM) 호출. 모든 Pod가 자기 Pod 번호를 남긴다. 연결 오류는 짧게 재시도."""
-        if not self.fence_stopped:
-            return None
+        """trainer가 끝난 뒤(SIGTERM) 모든 Pod가 호출. 내 STOP 이유와 상관없이 시도한다 — rank 0이 아닌 사이드카는
+        하트비트를 안 해서 펜싱을 모른 채 trainer(all_reduce로 같이 멈춤)만 끝날 수 있다 (11/23 EKS 시험).
+        진짜 펜싱인지는 DynamoDB 조건 generation > 내 세대가 판단: 정상 완료 · 사용자 중단 · 항목 없음은 skipped.
+        연결 오류는 짧게 재시도."""
         index = pod_index(self.cfg)
         for i in range(tries):
             try:
@@ -363,6 +364,8 @@ def main() -> None:
         while not stopping:
             touch_alive(alive)   # 기다리는 동안 liveness probe에 죽지 않게
             time.sleep(poll)
+    if stopping:
+        # SIGTERM = Pod 종료 중(trainer 끝남). STOP 이유와 상관없이 모든 Pod가 시도, 펜싱 여부는 DynamoDB 조건이 판단
         sc.record_self_fence()
     # 마지막 진행률(COMPLETED 등)을 간격과 상관없이 한 번 더. SIGTERM이면 trainer는 이미 끝났으므로 RUNNING → STOPPED.
     # 펜싱 STOP으로 끝날 때는 trainer가 아직 돌 수 있어 그대로 보낸다 (GPU-231)
