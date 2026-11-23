@@ -11,9 +11,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
+from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 
 APPROVABLE_PHASES = ("RESUMING", "COMPLETED")
+_SERIALIZER = TypeSerializer()
 
 
 def now_iso() -> str:
@@ -64,6 +66,14 @@ class JobItem:
     @property
     def recovery_id(self) -> str | None:
         return self._s("recovery_id")
+
+    @property
+    def new_jobset_name(self) -> str | None:
+        return self._s("new_jobset_name")
+
+    @property
+    def new_jobset_uid(self) -> str | None:
+        return self._s("new_jobset_uid")
 
 
 class FencingTable:
@@ -184,6 +194,63 @@ class FencingTable:
                     return res
                 # 그 사이 다른 승인이 끼어들어 approved_step만 바뀐 경우 → 다시 읽고 재시도
         return ApproveResult.STALE
+
+    # ---------- 복구 재개 증거 (rank 0 사이드카, GPU-254) ----------
+    def write_recovery_evidence(self, job_id: str, gen: int, owner: str, recovery_id: str, jobset_uid: str,
+                                evidence: dict[str, Any], attribute: str = "recovery_training_evidence") -> bool:
+        """복구 컨트롤러가 읽는 재개 증거 Map을 조건부로 기록 (K8s recovery-controller evidence.py progress 계약).
+        조건: 세대 · owner · recovery_id · new_jobset_uid가 모두 지금 실행과 같고, 복구가 새 실행 제출 뒤 단계일 때만.
+        하나라도 다르면(옛 실행 · 다른 복구 · 다른 JobSet) 쓰지 않는다 → False."""
+        try:
+            self.ddb.update_item(
+                TableName=self.table,
+                Key={"job_id": {"S": job_id}},
+                UpdateExpression="SET #ev = :ev",
+                ConditionExpression=(
+                    "generation = :g AND #o = :o AND recovery_id = :r AND new_jobset_uid = :u"
+                    " AND recovery_phase IN (:submitted, :resuming)"
+                ),
+                ExpressionAttributeNames={"#ev": attribute, "#o": "owner"},
+                ExpressionAttributeValues={
+                    ":ev": _SERIALIZER.serialize(evidence),
+                    ":g": {"N": str(gen)}, ":o": {"S": owner}, ":r": {"S": recovery_id}, ":u": {"S": jobset_uid},
+                    ":submitted": {"S": "NEW_RUN_SUBMITTED"}, ":resuming": {"S": "RESUMING"},
+                },
+            )
+            return True
+        except ClientError as e:
+            if _is_cond_fail(e):
+                return False
+            raise
+
+    # ---------- 자기 펜싱 기록 (모든 Pod 사이드카, GPU-257) ----------
+    def record_self_fence(self, job_id: str, gen: int, cluster: str, world_size: int, pod_index: int) -> str:
+        """펜싱 STOP 뒤 trainer가 끝난 Pod가 '세대 gen의 Pod pod_index 종료'를 남긴다 → relocator 종료 증거 (GPU-255).
+        같은 세대 기록이 있으면 self_fence_ranks에 ADD, 없거나 옛 세대 기록이면 내 번호 하나로 새로 SET
+        (옛 세대 번호가 섞이지 않게). 공통 조건 generation > gen: 정말 새 세대가 올라간 경우만 쓰고,
+        더 새 세대(self_fence_gen > gen)의 기록은 건드리지 않는다. 결과: "added" · "reset" · "skipped"(조건 불일치)"""
+        t = now_iso()
+        add = dict(
+            UpdateExpression="SET self_fence_at = :t ADD self_fence_ranks :r",
+            ConditionExpression="generation > :g AND self_fence_gen = :g",
+            ExpressionAttributeValues={":g": {"N": str(gen)}, ":r": {"NS": [str(pod_index)]}, ":t": {"S": t}},
+        )
+        reset = dict(
+            UpdateExpression=("SET self_fence_gen = :g, self_fence_cluster = :c, self_fence_world_size = :w,"
+                              " self_fence_ranks = :r, self_fence_at = :t"),
+            ConditionExpression="generation > :g AND (attribute_not_exists(self_fence_gen) OR self_fence_gen < :g)",
+            ExpressionAttributeValues={":g": {"N": str(gen)}, ":c": {"S": cluster}, ":w": {"N": str(world_size)},
+                                       ":r": {"NS": [str(pod_index)]}, ":t": {"S": t}},
+        )
+        # add → reset → add: 두 Pod가 동시에 처음 쓰면 한쪽 reset이 실패하므로 add로 한 번 더
+        for name, req in (("added", add), ("reset", reset), ("added", add)):
+            try:
+                self.ddb.update_item(TableName=self.table, Key={"job_id": {"S": job_id}}, **req)
+                return name
+            except ClientError as e:
+                if not _is_cond_fail(e):
+                    raise
+        return "skipped"
 
     # ---------- 복구 컨트롤러 동작 (테스트 · 로컬 시연용) ----------
     def start_recovery(self, job_id: str, gen: int, recovery_id: str) -> bool:

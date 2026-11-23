@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import events, layout
 from .config import Config
+from .evidence import RecoveryEvidence
 from .fencing import ApproveResult, FencingTable, now_iso
 from .log import log
 from .progress import ProgressReporter
@@ -36,8 +37,9 @@ class Sidecar:
                  rank_wait_seconds: float | None = None, keep_local: int | None = None,
                  heartbeat_seconds: float | None = None, image_digest: str | None = None,
                  publisher: events.Publisher | None = None, progress: ProgressReporter | None = None,
-                 approve_blocked_warn_seconds: float | None = None):
+                 approve_blocked_warn_seconds: float | None = None, evidence: RecoveryEvidence | None = None):
         self.cfg, self.fencing, self.store = cfg, fencing, store
+        self.evidence = evidence   # 복구 재개 증거 (rank 0, GPU-254)
         self.publisher = publisher or events.NullPublisher()
         self.progress = progress
         self.lifecycle_topic = os.environ.get("KAFKA_TOPIC_LIFECYCLE", "job.lifecycle")
@@ -54,13 +56,38 @@ class Sidecar:
         self._recovering_since: float | None = None
         self._blocked_warned_at: float | None = None
         self.stopped = False
+        self.stop_reason: str | None = None
 
     # ---------- 공통 ----------
     def _uploaded_marker(self, step: int) -> Path:
         return self.cfg.ckpt_dir / f"{layout.step_name(step)}.uploaded"
 
+    @property
+    def fence_stopped(self) -> bool:
+        """세대 · owner 불일치로 STOP (사용자 중단 · 항목 없음은 아님) → 자기 펜싱 기록 대상 (GPU-257)"""
+        return self.stop_reason in FENCE_STOP_REASONS
+
+    def record_self_fence(self, tries: int = 3, wait: float = 1.0) -> str | None:
+        """trainer가 끝난 뒤(SIGTERM) 호출. 모든 Pod가 자기 Pod 번호를 남긴다. 연결 오류는 짧게 재시도."""
+        if not self.fence_stopped:
+            return None
+        index = pod_index(self.cfg)
+        for i in range(tries):
+            try:
+                res = self.fencing.record_self_fence(self.cfg.job_id, self.cfg.generation, self.cfg.cluster,
+                                                     self.cfg.world_size, index)
+                log("sidecar.self_fence", result=res, generation=self.cfg.generation, pod_index=index,
+                    reason=self.stop_reason)
+                return res
+            except Exception as e:  # noqa: BLE001
+                log("sidecar.self_fence_error", error=repr(e), attempt=i + 1)
+                if i + 1 < tries:
+                    time.sleep(wait)
+        return None
+
     def stop(self, reason: str, **fields) -> None:
         if not self.stopped:
+            self.stop_reason = reason
             self.cfg.ckpt_dir.mkdir(parents=True, exist_ok=True)
             layout.stop_file(self.cfg.ckpt_dir).write_text(reason + "\n")
             log("sidecar.stop", reason=reason, **fields)
@@ -240,6 +267,8 @@ class Sidecar:
             return
         try:
             self.heartbeat()
+            if self.evidence is not None and not self.stopped:
+                self.evidence.tick()
             for step in self.done_steps():
                 if self.stopped:
                     return
@@ -268,6 +297,17 @@ class Sidecar:
             log("progress.error", error=repr(e))
 
 
+# 세대 · owner 불일치 STOP 이유 (heartbeat · 처리 전 확인 · 승인). no_item · 사용자 STOP 요청은 제외
+FENCE_STOP_REASONS = frozenset({"heartbeat_fenced", "generation_or_owner_mismatch", "approve_fenced"})
+
+
+def pod_index(cfg: Config) -> int:
+    """Pod 번호 0~N-1 (Indexed Job completion index). torch rank는 재시작 때 Pod끼리 바뀔 수 있어 쓰지 않음.
+    jobspec RANK도 같은 값(job-completion-index 어노테이션)이지만 쿠버네티스가 넣는 JOB_COMPLETION_INDEX를 먼저 본다."""
+    v = os.environ.get("JOB_COMPLETION_INDEX")
+    return int(v) if v not in (None, "") else cfg.rank
+
+
 ALIVE_FILE = "/tmp/sidecar-alive"  # ADR-44: jobspec exec liveness probe가 이 파일의 시각을 본다
 
 
@@ -290,8 +330,12 @@ def main() -> None:
         progress = ProgressReporter(os.environ["PROGRESS_FILE"], job_id=cfg.job_id, generation=cfg.generation,
                                     cluster=cfg.cluster, publisher=publisher,
                                     topic=os.environ.get("KAFKA_TOPIC_LIFECYCLE", "job.lifecycle"))
-    sc = Sidecar(cfg, FencingTable(cfg.table, region=cfg.region), Store(cfg.bucket, region=cfg.region),
-                 publisher=publisher, progress=progress)
+    fencing = FencingTable(cfg.table, region=cfg.region)
+    evidence = None
+    if cfg.rank == 0 and os.environ.get("PROGRESS_FILE"):
+        evidence = RecoveryEvidence(cfg, fencing, os.environ["PROGRESS_FILE"])
+    sc = Sidecar(cfg, fencing, Store(cfg.bucket, region=cfg.region),
+                 publisher=publisher, progress=progress, evidence=evidence)
     poll = float(os.environ.get("POLL_SECONDS", "2"))
     alive = os.environ.get("ALIVE_FILE", ALIVE_FILE)
     touch_alive(alive)
@@ -312,6 +356,14 @@ def main() -> None:
         if once or sc.stopped:
             break
         time.sleep(poll)
+    # 펜싱 STOP이면 바로 끝내지 않고 SIGTERM을 기다린다. kubelet은 trainer가 끝난 뒤에야 네이티브 사이드카에
+    # SIGTERM을 보내므로, 그때 남기는 기록 = 이 Pod의 trainer는 끝났다 (GPU-257, relocator 종료 증거)
+    if sc.fence_stopped and not once:
+        log("sidecar.wait_trainer_exit", reason=sc.stop_reason)
+        while not stopping:
+            touch_alive(alive)   # 기다리는 동안 liveness probe에 죽지 않게
+            time.sleep(poll)
+        sc.record_self_fence()
     # 마지막 진행률(COMPLETED 등)을 간격과 상관없이 한 번 더. SIGTERM이면 trainer는 이미 끝났으므로 RUNNING → STOPPED.
     # 펜싱 STOP으로 끝날 때는 trainer가 아직 돌 수 있어 그대로 보낸다 (GPU-231)
     sc.report_progress(force=True, final=stopping)
