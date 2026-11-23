@@ -11,9 +11,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
+from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 
 APPROVABLE_PHASES = ("RESUMING", "COMPLETED")
+_SERIALIZER = TypeSerializer()
 
 
 def now_iso() -> str:
@@ -184,6 +186,34 @@ class FencingTable:
                     return res
                 # 그 사이 다른 승인이 끼어들어 approved_step만 바뀐 경우 → 다시 읽고 재시도
         return ApproveResult.STALE
+
+    # ---------- 복구 재개 증거 (rank 0 사이드카, GPU-254) ----------
+    def write_recovery_evidence(self, job_id: str, gen: int, owner: str, recovery_id: str, jobset_uid: str,
+                                evidence: dict[str, Any], attribute: str = "recovery_training_evidence") -> bool:
+        """복구 컨트롤러가 읽는 재개 증거 Map을 조건부로 기록 (K8s recovery-controller evidence.py progress 계약).
+        조건: 세대 · owner · recovery_id · new_jobset_uid가 모두 지금 실행과 같고, 복구가 새 실행 제출 뒤 단계일 때만.
+        하나라도 다르면(옛 실행 · 다른 복구 · 다른 JobSet) 쓰지 않는다 → False."""
+        try:
+            self.ddb.update_item(
+                TableName=self.table,
+                Key={"job_id": {"S": job_id}},
+                UpdateExpression="SET #ev = :ev",
+                ConditionExpression=(
+                    "generation = :g AND #o = :o AND recovery_id = :r AND new_jobset_uid = :u"
+                    " AND recovery_phase IN (:submitted, :resuming)"
+                ),
+                ExpressionAttributeNames={"#ev": attribute, "#o": "owner"},
+                ExpressionAttributeValues={
+                    ":ev": _SERIALIZER.serialize(evidence),
+                    ":g": {"N": str(gen)}, ":o": {"S": owner}, ":r": {"S": recovery_id}, ":u": {"S": jobset_uid},
+                    ":submitted": {"S": "NEW_RUN_SUBMITTED"}, ":resuming": {"S": "RESUMING"},
+                },
+            )
+            return True
+        except ClientError as e:
+            if _is_cond_fail(e):
+                return False
+            raise
 
     # ---------- 복구 컨트롤러 동작 (테스트 · 로컬 시연용) ----------
     def start_recovery(self, job_id: str, gen: int, recovery_id: str) -> bool:
