@@ -74,19 +74,29 @@ def test_newer_generation_record_is_not_touched(fencing):
     assert _fields(fencing)[:2] == (2, [0])
 
 
-def test_sidecar_records_only_for_fence_stops(fencing, store, tmp_path, monkeypatch):
+def test_rank_that_never_saw_fencing_still_records(fencing, store, tmp_path, monkeypatch):
+    """11/23 EKS: rank 1 사이드카는 하트비트를 안 해서 펜싱을 모른 채 SIGTERM을 받는다 → 그래도 기록해야 함."""
     monkeypatch.delenv("JOB_COMPLETION_INDEX", raising=False)
     _job(fencing)
+    rank0 = Sidecar(_cfg(tmp_path, rank=0), fencing, store, heartbeat_seconds=0)
+    rank1 = Sidecar(_cfg(tmp_path, rank=1), fencing, store, heartbeat_seconds=0)
     _advance(fencing, 2)
-    sc = Sidecar(_cfg(tmp_path, rank=1), fencing, store)
-    sc.stop("generation_or_owner_mismatch")
-    assert sc.fence_stopped and sc.record_self_fence() == "reset"
-    assert _fields(fencing)[1] == [1]
+    rank0.tick()
+    rank1.tick()                                                           # 저장이 없으면 rank 1은 세대를 안 봄
+    assert rank0.fence_stopped and not rank1.stopped
+    assert rank0.record_self_fence() == "reset"
+    assert rank1.record_self_fence() == "added"
+    assert _fields(fencing)[:2] == (1, [0, 1])
 
-    other = Sidecar(_cfg(tmp_path, rank=0), fencing, store)
-    other.stop("no_item")                                                  # 펜싱이 아닌 STOP은 기록 안 함
-    assert not other.fence_stopped and other.record_self_fence() is None
-    assert _fields(fencing)[1] == [1]
+
+def test_normal_end_or_user_stop_is_skipped_by_condition(fencing, store, tmp_path):
+    _job(fencing)                                                          # 세대 그대로 = 정상 완료 · 사용자 중단
+    sc = Sidecar(_cfg(tmp_path), fencing, store)
+    assert sc.record_self_fence() == "skipped"
+    gone = Sidecar(_cfg(tmp_path), fencing, store)
+    fencing.ddb.delete_item(TableName=fencing.table, Key={"job_id": {"S": JOB}})
+    assert gone.record_self_fence() == "skipped"                           # 항목 없음(no_item)
+    assert fencing.get(JOB) is None                                        # 조건부 쓰기가 항목을 새로 만들지 않음
 
 
 def test_heartbeat_fence_then_record(fencing, store, tmp_path):
