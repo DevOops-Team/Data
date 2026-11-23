@@ -57,6 +57,8 @@ S3 · DynamoDB 주소는 boto3 표준 `AWS_ENDPOINT_URL`로 바꾼다(로컬만)
 승인 막힘 로그 (GPU-228): rank 0이 복구 중(`RECOVERING`, 펜싱 테이블 `recovery_phase`가 승인 불가 값)으로 승인을 못 하는 시간이 `APPROVE_BLOCKED_WARN_SECONDS`(600)를 넘으면 `sidecar.approve_blocked`(`job_id` · `generation` · `step` · `blocked_s` · `recovery_phase` · `recovery_id`)를 남기고 같은 간격마다 반복, 승인되면 `sidecar.approve_unblocked`. 복구가 중간 단계에서 HOLD로 멈춰 학습은 도는데 승인이 안 느는 경우를 드러내려는 것 — Loki에서 이 로그로 알림을 걸 수 있다.
 
 생존 파일 (ADR-44, GPU-213): 메인 루프가 한 바퀴 돌 때마다 `ALIVE_FILE`(기본 `/tmp/sidecar-alive`, 빈 값이면 끔)의 시각을 갱신한다. 별도 스레드가 아니라 루프 안이라, 사이드카가 멈추면(hang) 시각도 멈춘다. jobspec의 exec liveness probe가 이 시각이 300초보다 오래되면 사이드카만 재시작한다 — 업로드 · 승인 상태는 `/ckpt`의 표식 파일(`.uploaded` · `.approved`)에 있어 재시작 뒤 이어서 한다.
+
+복구 재개 증거 (GPU-254): 복구로 뜬 세대(펜싱 테이블 `recovery_id` 있음 · `recovery_phase` `NEW_RUN_SUBMITTED` · `RESUMING`)에서 trainer 진행률 step이 복원 지점(`resume.json` `approved_step`, 처음부터면 0)을 넘으면, rank 0이 펜싱 테이블 `recovery_training_evidence`(Map)를 조건부로 쓴다 — 조건 `generation` · `owner` · `recovery_id` · `new_jobset_uid`가 모두 지금 실행과 같을 때만. 복구 컨트롤러가 이걸 읽어 RESUMING → COMPLETED (K8s `recovery-controller/recovery/evidence.py` progress 계약: `kind` · `schema_version` 1 · `job_id` · `recovery_id` · `generation` · `cluster` · `jobset_uid` · `event_id` · `observed_at` · `outcome` · `completed_step` · `checkpoint_loaded` + `restored_gen/step` 또는 `started_from_scratch`, 실패면 `failure_reason`). 컨트롤러가 300초 넘은 증거를 거절하므로 복구가 끝날 때까지 `EVIDENCE_REFRESH_SECONDS`(60)마다 다시 쓴다. 환경 변수 `JOBSET_UID`(이 Pod를 만든 JobSet UID, jobspec 주입) — 없으면 쓰지 않고 `evidence.no_jobset_uid` 로그 (`ckpt/evidence.py`).
 ```yaml
 livenessProbe:
   exec: {command: ["sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /tmp/sidecar-alive) )) -lt 300"]}

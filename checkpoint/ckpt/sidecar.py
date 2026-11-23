@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import events, layout
 from .config import Config
+from .evidence import RecoveryEvidence
 from .fencing import ApproveResult, FencingTable, now_iso
 from .log import log
 from .progress import ProgressReporter
@@ -36,8 +37,9 @@ class Sidecar:
                  rank_wait_seconds: float | None = None, keep_local: int | None = None,
                  heartbeat_seconds: float | None = None, image_digest: str | None = None,
                  publisher: events.Publisher | None = None, progress: ProgressReporter | None = None,
-                 approve_blocked_warn_seconds: float | None = None):
+                 approve_blocked_warn_seconds: float | None = None, evidence: RecoveryEvidence | None = None):
         self.cfg, self.fencing, self.store = cfg, fencing, store
+        self.evidence = evidence   # 복구 재개 증거 (rank 0, GPU-254)
         self.publisher = publisher or events.NullPublisher()
         self.progress = progress
         self.lifecycle_topic = os.environ.get("KAFKA_TOPIC_LIFECYCLE", "job.lifecycle")
@@ -240,6 +242,8 @@ class Sidecar:
             return
         try:
             self.heartbeat()
+            if self.evidence is not None and not self.stopped:
+                self.evidence.tick()
             for step in self.done_steps():
                 if self.stopped:
                     return
@@ -290,8 +294,13 @@ def main() -> None:
         progress = ProgressReporter(os.environ["PROGRESS_FILE"], job_id=cfg.job_id, generation=cfg.generation,
                                     cluster=cfg.cluster, publisher=publisher,
                                     topic=os.environ.get("KAFKA_TOPIC_LIFECYCLE", "job.lifecycle"))
-    sc = Sidecar(cfg, FencingTable(cfg.table, region=cfg.region), Store(cfg.bucket, region=cfg.region),
-                 publisher=publisher, progress=progress)
+    fencing = FencingTable(cfg.table, region=cfg.region)
+    evidence = None
+    if cfg.rank == 0 and os.environ.get("PROGRESS_FILE"):
+        # JOBSET_UID: 이 Pod를 만든 JobSet UID (jobspec 주입, 복구 컨트롤러 new_jobset_uid와 같은 쪽). 없으면 증거를 안 씀
+        evidence = RecoveryEvidence(cfg, fencing, os.environ["PROGRESS_FILE"], os.environ.get("JOBSET_UID") or None)
+    sc = Sidecar(cfg, fencing, Store(cfg.bucket, region=cfg.region),
+                 publisher=publisher, progress=progress, evidence=evidence)
     poll = float(os.environ.get("POLL_SECONDS", "2"))
     alive = os.environ.get("ALIVE_FILE", ALIVE_FILE)
     touch_alive(alive)
