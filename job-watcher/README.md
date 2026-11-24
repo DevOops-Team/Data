@@ -24,7 +24,7 @@
 | `job.fenced` | 종료 조건 없이 삭제 + `spec.jobRef`가 이 JobSet인 RelocationRequest 있음. payload `request_id` · `action` | `deletionTimestamp` |
 | `job.cancelled` | 종료 조건 없이 삭제 + RelocationRequest 없음 + 주석 `devoops/stop-reason: user` (Backend 사용자 중단이 지우기 전에 닮, payload `reason` · `requested_at`) → 화면 `CANCELLED` | `deletionTimestamp` |
 | `job.stopped` | 종료 조건 없이 삭제 + RelocationRequest 없음 + 중단 주석 없음 (수동 삭제 등) | `deletionTimestamp` |
-| `job.evicted` | Workload `Evicted=True` — Kueue가 내림. `reason` `PodsReadyTimeout`(입장 뒤 `waitForPodsReady.timeout` 10분 안에 Pod 전부 Ready 실패: ckpt-init 다운로드 · 이미지 pull이 길 때, GPU-256) · `Preempted` 등. 종료가 아니라 Kueue가 같은 세대로 다시 넣음(최대 `backoffLimitCount` 3번). 발생마다 한 번, payload `reason` · `message` · `requeue_count` (GPU-259) | 조건 시각 |
+| `job.evicted` | Workload `Evicted=True` — Kueue가 내림. `reason` `PodsReadyTimeout`(입장 뒤 `waitForPodsReady.timeout` 20분(11/23 GPU-264, 전에는 10분) 안에 Pod 전부 Ready 실패: ckpt-init 다운로드 · 이미지 pull이 길 때, GPU-256) · `Preempted` 등. 종료가 아니라 Kueue가 같은 세대로 다시 넣음(최대 `backoffLimitCount` 3번). 발생마다 한 번, payload `reason` · `message` · `requeue_count` (GPU-259) | 조건 시각 |
 | `job.deactivated` | Workload `spec.active=false` — 다시 넣기 한도를 넘어 Kueue가 멈춤, 더 안 넣음. 이미 끝난 세대면 안 보냄. payload 같음 (GPU-259) | 본 시각 |
 
 - `event_id = job-{작업ID}-g{세대 4자리}-{key}` (key: submitted · admitted · placed · started · end · `evicted-{조건 시각 숫자}` · deactivated). 세대마다 종료는 하나(`-end`), 내림은 발생마다. 이미 끝난 잡을 나중에 지우면 사건 없음
