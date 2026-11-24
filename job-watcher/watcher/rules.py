@@ -21,8 +21,9 @@
              job.stopped                   종료 조건 없이 삭제 + RelocationRequest 없음 + 중단 주석 없음 (수동 삭제 등)
 
 Kueue가 내림 · 비활성화 (GPU-259, GPU-256 후속) — 종료가 아님. 세대 안에서 Kueue가 같은 세대로 다시 넣는다
-  evicted-<시각>  job.evicted                Workload Evicted=True. reason: PodsReadyTimeout(10분 안에 Pod 전부   조건 lastTransitionTime
-                                             Ready 실패, ckpt-init 다운로드 · 이미지 pull이 길 때) · Preempted 등.
+  evicted-<시각>  job.evicted                Workload Evicted=True. reason: PodsReadyTimeout(20분 안에 Pod 전부   조건 lastTransitionTime
+                                             Ready 실패 — 11/23 GPU-264로 10분 → 20분, ckpt-init 다운로드 ·
+                                             이미지 pull이 길 때) · Preempted 등.
                                              발생마다 시각이 달라 여러 번 나감. payload reason · message · requeue_count
   deactivated     job.deactivated            Workload spec.active=false (다시 넣기 한도 backoffLimitCount 초과 등)   감시기가 본 시각
                                              → 그 뒤 Kueue는 다시 넣지 않음. 이미 끝난(end) 세대면 안 보냄
