@@ -20,7 +20,7 @@
 재시도: 일시 오류는 3회(5 → 10 → 20초), 다운로드 전체 제한 DOWNLOAD_DEADLINE_S(기본 600초).
 복구 컨트롤러의 '복원 · 학습 진행 확인 30분' 안에 끝나도록 한다.
 
-다운로드 감시 (GPU-263, ckpt/download_watch.py): Kueue 10분 안에 못 끝날 다운로드를 1분 안에 알아챈다.
+다운로드 감시 (GPU-263, ckpt/download_watch.py): Kueue 대기(20분) 안에 못 끝날 다운로드를 1분 안에 알아챈다.
   예상 시간이 여유 뺀 예산을 넘으면 job.init_slow 경고(계속 받음), Kueue 한계를 넘으면 실패 download_too_slow,
   60초 동안 0바이트면 실패 download_stalled. 실패는 바로 보고하고 프로세스를 끝낸다(종료 코드 4).
 """
