@@ -152,3 +152,45 @@ def test_no_eviction_events_on_normal_run_or_after_end():
     assert not any(p.type in ("job.evicted", "job.deactivated") for p in normal)
     done = plan(snapshot(jobset(completed="2026-11-23T06:00:00Z"), workload(WL, active=False)), observed_at=NOW)
     assert not any(p.type == "job.deactivated" for p in done)            # 이미 끝난 세대는 비활성화 안 보냄
+
+
+
+def _pl(nodes=("ip-b", "ip-a"), cluster="eks-a", gen=1, jobset="job-3f9a1c2e-g0001", observed=1795506090, version=1):
+    import json
+    return json.dumps({"version": version, "jobset": jobset, "generation": gen, "cluster": cluster,
+                       "nodes": list(nodes), "observed_at": observed})
+
+
+def test_placement_event_from_dispatcher_annotation():
+    """GPU-275: dispatcher 주석 → job.placement (정렬된 노드, 관리 JobSet UID, 주석 관측 시각)."""
+    s = snapshot(jobset(ready=4), workload("job-3f9a1c2e-g0001", admitted="2026-11-12T01:00:05Z", cluster="eks-a",
+                                           placement=_pl()))
+    out = [p for p in plan(s, observed_at=NOW) if p.type == "job.placement"]
+    assert len(out) == 1 and out[0].key.startswith("placement-")
+    assert out[0].occurred_at == "2026-11-24T07:41:30Z" and out[0].time_source == "k8s"
+    assert out[0].extra == {"placement_generation": 1, "placement_cluster": "eks-a", "active_nodes": ["ip-a", "ip-b"],
+                            "observed_at": 1795506090, "placement_version": 1}
+    assert s.jobset_uid == "uid-job-3f9a1c2e-g0001"
+
+
+def test_placement_same_key_when_only_observed_at_changes_new_key_when_nodes_change():
+    def key(**kw):
+        s = snapshot(jobset(), workload("job-3f9a1c2e-g0001", cluster="eks-a", placement=_pl(**kw)))
+        return [p.key for p in plan(s, observed_at=NOW) if p.type == "job.placement"][0]
+    assert key(observed=1) == key(observed=999)                    # 60초마다 갱신돼도 다시 안 보냄
+    assert key(nodes=("ip-a", "ip-b")) == key(nodes=("ip-b", "ip-a"))
+    assert key(nodes=("ip-a", "ip-c")) != key(nodes=("ip-a", "ip-b"))
+
+
+def test_placement_ignored_when_invalid_or_for_other_run():
+    bad = [_pl(jobset="job-3f9a1c2e-g0002"), _pl(gen=2), _pl(version=2), _pl(nodes=()), _pl(nodes=("ip-a", "ip-a")),
+           _pl(cluster="eks-b"), "{not json", '{"version":1}']
+    for raw in bad:
+        s = snapshot(jobset(), workload("job-3f9a1c2e-g0001", cluster="eks-a", placement=raw))
+        assert not [p for p in plan(s, observed_at=NOW) if p.type == "job.placement"], raw
+
+
+def test_no_placement_event_after_delete():
+    s = snapshot(jobset(deletion="2026-11-12T03:00:00Z"),
+                 workload("job-3f9a1c2e-g0001", cluster="eks-a", placement=_pl()), deleted=True)
+    assert not [p for p in plan(s, observed_at=NOW) if p.type == "job.placement"]

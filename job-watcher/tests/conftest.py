@@ -24,7 +24,7 @@ def jobset(job_id: str = "3f9a1c2e", gen: int = 1, *, pods: int = 4, ready: int 
         conditions.append({"type": "Failed", "status": "True", "lastTransitionTime": failed,
                            "message": "jobset failed due to job failure"})
     meta: dict[str, Any] = {
-        "name": name, "namespace": "training", "creationTimestamp": created,
+        "name": name, "namespace": "training", "creationTimestamp": created, "uid": f"uid-{name}",
         "labels": {"devoops/generation": str(gen), "kueue.x-k8s.io/queue-name": "queue-heavy"},
         "annotations": {"devoops/exp-id": "exp-0001", **(annotations or {})},
     }
@@ -47,7 +47,8 @@ def jobset(job_id: str = "3f9a1c2e", gen: int = 1, *, pods: int = 4, ready: int 
 def workload(jobset_name: str, *, admitted: str | None = None, cluster: str | None = None,
              cluster_at: str | None = None, pods_ready: str | None = None,
              evicted: str | None = None, evicted_reason: str = "PodsReadyTimeout",
-             requeue_count: int | None = None, active: bool | None = None) -> dict[str, Any]:
+             requeue_count: int | None = None, active: bool | None = None,
+             placement: str | None = None) -> dict[str, Any]:
     conditions = []
     if evicted:
         conditions.append({"type": "Evicted", "status": "True", "lastTransitionTime": evicted,
@@ -68,6 +69,7 @@ def workload(jobset_name: str, *, admitted: str | None = None, cluster: str | No
     return {
         "apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "Workload", "spec": spec,
         "metadata": {"name": f"jobset-{jobset_name}-abcde", "namespace": "training",
+                     **({"annotations": {"devoops/placement": placement}} if placement else {}),
                      "ownerReferences": [{"apiVersion": "jobset.x-k8s.io/v1alpha2", "kind": "JobSet",
                                           "name": jobset_name}]},
         "status": status,
