@@ -131,9 +131,11 @@ def test_v_incidents_from_collected_events(conn, collector_conn):
             payload={"ts": "2026-11-16T10:00:03Z"}),
         msg("fault.reclassified", topic="gpu.fault", node="n1", job_id="j1", occurred_at="2026-11-16T10:00:20.000Z"),
         msg("job.resumed", job_id="j1", generation=2, occurred_at="2026-11-16T10:03:20.000Z"),
+        msg("job.progress", topic="job.progress", job_id="j1", generation=2, occurred_at="2026-11-16T10:03:50.000Z",
+            payload={"status": "RUNNING", "step": 1}),
     ])
-    r = one(conn, "SELECT detect_s, classify_s, recover_s, signal_lag_s FROM data.v_incidents")
-    assert [float(x) for x in r] == [5.0, 20.0, 180.0, 2.0]
+    r = one(conn, "SELECT detect_s, classify_s, recover_s, signal_lag_s, pods_ready_s FROM data.v_incidents")
+    assert [float(x) for x in r] == [5.0, 20.0, 210.0, 2.0, 180.0]
 
 
 def test_v_incidents_skips_user_restart_resume(conn, collector_conn):
@@ -143,10 +145,14 @@ def test_v_incidents_skips_user_restart_resume(conn, collector_conn):
         msg("fault.detected", topic="gpu.fault", node="n2", job_id="j2", occurred_at="2026-11-16T11:00:10.000Z"),
         msg("job.resumed", job_id="j2", generation=2, occurred_at="2026-11-16T11:01:00.000Z",
             payload={"restart_reason": "user"}),
+        msg("job.progress", topic="job.progress", job_id="j2", generation=2, occurred_at="2026-11-16T11:01:30.000Z",
+            payload={"status": "RUNNING", "step": 5}),
         msg("job.resumed", job_id="j2", generation=3, occurred_at="2026-11-16T11:04:10.000Z"),
+        msg("job.progress", topic="job.progress", job_id="j2", generation=3, occurred_at="2026-11-16T11:04:40.000Z",
+            payload={"status": "RUNNING", "step": 6}),
     ])
-    r = one(conn, "SELECT recover_s FROM data.v_incidents WHERE job_id = 'j2'")
-    assert float(r[0]) == 240.0
+    r = one(conn, "SELECT recover_s, pods_ready_s FROM data.v_incidents WHERE job_id = 'j2'")
+    assert [float(x) for x in r] == [270.0, 240.0]
 
 
 def test_v_incidents_ignores_later_fault_on_same_node(conn, collector_conn):
@@ -160,6 +166,33 @@ def test_v_incidents_ignores_later_fault_on_same_node(conn, collector_conn):
     ])
     rows = conn.execute("SELECT job_id, detect_s, classify_s FROM data.v_incidents ORDER BY injected_at").fetchall()
     assert [(r[0], None if r[2] is None else float(r[2])) for r in rows] == [("j-test", None), ("j-real", 38.0)]
+
+
+def test_v_incidents_recover_ends_at_first_step_after_approved(conn, collector_conn):
+    """복구 끝 = 새 세대가 승인본 다음 step을 실제로 진행한 첫 시각 (GPU-283, db/010). 11/25 17:22 실제 사례:
+    새 세대 Pod는 Ready(job.resumed)였지만 trainer가 옛 세대 주소를 기다려 step이 안 올랐다 → recover_s는 비어야 한다.
+    옛 세대의 진행 · 승인본과 같은 step(복원 직후)은 끝으로 세지 않는다."""
+    j = dict(job_id="j5", node="n5")
+    run(collector_conn, [
+        msg("checkpoint.approved", topic="checkpoint", job_id="j5", generation=1, occurred_at="2026-11-25T08:10:00.000Z",
+            payload={"step": 443, "format": "dcp", "world_size": 2, "manifest_key": "k", "file_count": 2,
+                     "size_bytes": 1, "config_sha256": "c"}),
+        msg("fault.injected", topic="fault.injection", occurred_at="2026-11-25T08:20:00.000Z", **j),
+        msg("fault.detected", topic="gpu.fault", generation=1, occurred_at="2026-11-25T08:20:40.000Z", **j),
+        msg("job.progress", topic="job.progress", job_id="j5", generation=1, occurred_at="2026-11-25T08:20:41.000Z",
+            payload={"status": "RUNNING", "step": 600}),
+        msg("job.resumed", job_id="j5", generation=2, occurred_at="2026-11-25T08:21:45.000Z"),
+    ])
+    r = one(conn, "SELECT recover_s, pods_ready_s FROM data.v_incidents WHERE job_id = 'j5'")
+    assert r[0] is None and float(r[1]) == 65.0                  # Pod만 준비 → 복구 끝 아님
+    run(collector_conn, [
+        msg("job.progress", topic="job.progress", job_id="j5", generation=2, occurred_at="2026-11-25T08:22:00.000Z",
+            payload={"status": "RUNNING", "step": 443}),
+        msg("job.progress", topic="job.progress", job_id="j5", generation=2, occurred_at="2026-11-25T08:22:30.000Z",
+            payload={"status": "RUNNING", "step": 450}),
+    ])
+    r = one(conn, "SELECT recover_s FROM data.v_incidents WHERE job_id = 'j5'")
+    assert float(r[0]) == 110.0
 
 
 def test_new_generation_inherits_from_previous(conn, collector_conn):
