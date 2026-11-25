@@ -77,6 +77,10 @@ def pg_dsn():
     with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:
         c.execute(sql008)
         c.execute(sql008)                                        # 다시 실행해도 안전한지
+    sql009 = (ROOT / "db" / "009_incident_window.sql").read_text()
+    with psycopg.connect(f"{base} user=data_app", autocommit=True) as c:
+        c.execute(sql009)
+        c.execute(sql009)                                        # 다시 실행해도 안전한지
     yield {"owner": f"{base} user=data_app", "collector": f"{base} user=data_collector",
            "exporter": f"{base} user=postgres_exporter", "backend": f"{base} user=backend_ro",
            "grafana": f"{base} user=grafana_ro"}

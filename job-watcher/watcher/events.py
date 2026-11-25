@@ -31,7 +31,7 @@ def event_id(job_id: str, generation: int, key: str) -> str:
 
 def build(s: Snapshot, p: Planned) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "jobset_name": s.name, "queue": s.queue, "gpus": s.gpus, "exp_id": s.exp_id,
+        "jobset_name": s.name, "jobset_uid": s.jobset_uid, "queue": s.queue, "gpus": s.gpus, "exp_id": s.exp_id,
         "recovery_id": s.recovery_id, "config_sha256": s.config_sha256, "image_digest": s.image_digest,
         "cluster": s.cluster, "time_source": p.time_source, **p.extra,
     }

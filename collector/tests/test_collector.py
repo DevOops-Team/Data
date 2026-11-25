@@ -149,6 +149,19 @@ def test_v_incidents_skips_user_restart_resume(conn, collector_conn):
     assert float(r[0]) == 240.0
 
 
+def test_v_incidents_ignores_later_fault_on_same_node(conn, collector_conn):
+    """감지 · 분류 사건은 장애 시작 뒤 15분 안의 것만 (GPU-269, db/009). 11/24 실제 사례: HOLD만 난 시험 사건 뒤
+    2시간 반 지나 같은 노드에서 다른 작업이 장애 → 첫 장애에 그 감지가 붙어 job_id · classify_s가 바뀌었다."""
+    run(collector_conn, [
+        msg("fault.held", topic="gpu.fault", node="n3", job_id="j-test", occurred_at="2026-11-24T05:14:13.000Z",
+            payload={"ts": "2026-11-24T05:14:13Z", "dedup_key": "k-test"}),
+        msg("fault.detected", topic="gpu.fault", node="n3", job_id="j-real", occurred_at="2026-11-24T07:44:49.000Z",
+            payload={"ts": "2026-11-24T07:44:11Z", "dedup_key": "k-real"}),
+    ])
+    rows = conn.execute("SELECT job_id, detect_s, classify_s FROM data.v_incidents ORDER BY injected_at").fetchall()
+    assert [(r[0], None if r[2] is None else float(r[2])) for r in rows] == [("j-test", None), ("j-real", 38.0)]
+
+
 def test_new_generation_inherits_from_previous(conn, collector_conn):
     """복구로 생긴 세대(job.submitted 없이 job.resumed만 옴)는 이전 세대 값을 이어받는다. queue · cluster는 제외."""
     env1 = {"job_id": "j-inh", "generation": 1, "cluster": "eks-a"}

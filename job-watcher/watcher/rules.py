@@ -8,6 +8,9 @@
                                            첫 제출(세대 1)은 Backend가 이미 보내므로 기본으로 안 보냄
   admitted   job.admitted                  Workload Admitted=True (Kueue 쿼터 확보 · 입장)      조건 lastTransitionTime
   placed     job.placed                    Workload status.clusterName (MultiKueue 배치)       admissionCheck Ready 시각, 없으면 Admitted 시각
+  placement-<해시>  job.placement             Workload 주석 devoops/placement (dispatcher 실제 배치,   주석의 observed_at
+                                           GPU-268) — cluster · nodes가 바뀔 때마다. payload active_nodes ·
+                                           placement_generation · observed_at, 복구 컨트롤러 작업 등록용 (GPU-275)
   started    job.started   (recovery-id 없음)  Workload PodsReady=True                         조건 lastTransitionTime
              job.resumed   (재제출본)          없으면 JobSet replicatedJob 전부 ready            감시기가 본 시각 (time_source=observed)
              사용자 다시 시작이면 submitted · resumed payload에 restart_reason · restart_requested_at
@@ -21,8 +24,9 @@
              job.stopped                   종료 조건 없이 삭제 + RelocationRequest 없음 + 중단 주석 없음 (수동 삭제 등)
 
 Kueue가 내림 · 비활성화 (GPU-259, GPU-256 후속) — 종료가 아님. 세대 안에서 Kueue가 같은 세대로 다시 넣는다
-  evicted-<시각>  job.evicted                Workload Evicted=True. reason: PodsReadyTimeout(10분 안에 Pod 전부   조건 lastTransitionTime
-                                             Ready 실패, ckpt-init 다운로드 · 이미지 pull이 길 때) · Preempted 등.
+  evicted-<시각>  job.evicted                Workload Evicted=True. reason: PodsReadyTimeout(20분 안에 Pod 전부   조건 lastTransitionTime
+                                             Ready 실패 — 11/23 GPU-264로 10분 → 20분, ckpt-init 다운로드 ·
+                                             이미지 pull이 길 때) · Preempted 등.
                                              발생마다 시각이 달라 여러 번 나감. payload reason · message · requeue_count
   deactivated     job.deactivated            Workload spec.active=false (다시 넣기 한도 backoffLimitCount 초과 등)   감시기가 본 시각
                                              → 그 뒤 Kueue는 다시 넣지 않음. 이미 끝난(end) 세대면 안 보냄
@@ -36,10 +40,18 @@ Kueue가 내림 · 비활성화 (GPU-259, GPU-256 후속) — 종료가 아님. 
 """
 from __future__ import annotations
 
+import hashlib
+from datetime import datetime, timezone
+
 from dataclasses import dataclass, field
 from typing import Any
 
 from .model import Snapshot
+
+
+def _epoch_iso(sec: int) -> str:
+    """dispatcher observed_at(Unix 초) → '2026-11-25T03:30:00Z'."""
+    return datetime.fromtimestamp(sec, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _compact(ts: str) -> str:
@@ -75,6 +87,14 @@ def plan(s: Snapshot, *, observed_at: str, emit_first_submitted: bool = False) -
         add("admitted", "job.admitted", s.admitted_at)
     if s.cluster:
         add("placed", "job.placed", s.placed_at)
+    # 실제 배치 (GPU-275): dispatcher 주석이 생기거나 노드 · 클러스터가 바뀔 때마다 1건. observed_at만 바뀐 갱신은 같은 key라 다시 안 감.
+    # 복구 컨트롤러가 recovery_table 작업 등록(active_nodes · placement_generation · jobset_uid)에 쓴다
+    pl = s.placement
+    if pl and not s.deleted and (s.cluster is None or pl["cluster"] == s.cluster):
+        digest = hashlib.sha256((pl["cluster"] + "|" + ",".join(pl["nodes"])).encode()).hexdigest()[:12]
+        add(f"placement-{digest}", "job.placement", _epoch_iso(pl["observed_at"]),
+            placement_generation=s.generation, placement_cluster=pl["cluster"], active_nodes=pl["nodes"],
+            observed_at=pl["observed_at"], placement_version=pl["version"])
 
     start_type = "job.resumed" if resubmitted else "job.started"
     if s.pods_ready_at is not None:
