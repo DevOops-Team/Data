@@ -7,8 +7,9 @@
 #   ghcr.io/devoops-team/trainer         trainer/           학습 Pod의 trainer 컨테이너 = 학습 환경만 (torch · CUDA · transformers).
 #                                                           train.py는 사용자가 올리고 ckpt-init이 /data/code/train.py로 넣는다 (GPU-153 · GPU-154)
 #
-#   PR               : 네 이미지 모두 테스트 + 이미지 빌드 · 점검 (push 안 함)
-#   main push(머지)   : 같은 검사 → 릴리스 버전 계산 → 바뀐 폴더의 이미지만 push {X.Y.Z, X.Y, main, sha-<7자리>}
+#   PR               : 네 이미지 모두 테스트 + 바뀐 폴더의 이미지만 빌드 · 점검 (push 안 함). 테스트와 이미지 빌드는 병렬 (GPU-282)
+#   main push(머지)   : 릴리스 버전 계산 → 바뀐 폴더의 이미지만 빌드 · 점검 · push {X.Y.Z, X.Y, main, sha-<7자리>}
+#                       테스트는 다시 돌리지 않는다: develop → main PR에서 같은 트리를 이미 검사했다 (GPU-282)
 #                       → 버전 봇이 태그 vX.Y.Z · Release 생성
 #                       → Variable DEPLOY_IMAGES(쉼표 목록, 공백 없이)에 든 이미지만 배포 봇이 Gitops overlay에 X.Y.Z@digest 반영
 #
@@ -19,7 +20,9 @@
 #
 # main 필수 검사: "<이름> · test" · "<이름> · image" (checkpoint · collector · job-watcher · trainer, matrix job 이름).
 #   이미지를 더하면 저장소 설정(브랜치 보호)의 필수 검사에도 두 개를 더한다.
-#   경로 필터를 걸면 해당 경로를 건드리지 않는 PR이 검사 대기로 막히므로 모든 PR에서 전부 돈다.
+#   경로 필터(on.paths)를 걸면 해당 경로를 건드리지 않는 PR이 검사 대기로 막히므로 job은 모든 PR에서 전부 돌고,
+#   안 바뀐 이미지는 job 안에서 빌드 step만 건너뛴다. job 단위 if로 건너뛰면 matrix 이름이 안 풀린 채로 보고돼
+#   필수 검사가 대기로 남는다 (GPU-282).
 # 안 바뀐 이미지를 다시 push하면 digest가 달라져 불필요한 재배포가 생기므로 main에서도 바뀐 것만 push한다.
 # 새 이미지 추가: matrix.include 두 곳(test · image)과 changes job의 판정에 한 줄씩, 배포하려면 아래 deploy-targets 표에도.
 name: CI
@@ -46,7 +49,7 @@ jobs:
       contents: read
       pull-requests: read
 
-  # main push에서 push · 배포할 이미지 고르기 (자기 폴더 · 이 파일 기준)
+  # 빌드(PR) · push · 배포(main push)할 이미지 고르기 (자기 폴더 · 이 파일 기준). workflow_dispatch는 전부
   changes:
     name: changes
     runs-on: ubuntu-24.04
@@ -62,11 +65,18 @@ jobs:
           BEFORE: ${{ github.event.before }}
         run: |
           all="checkpoint collector job-watcher trainer"
-          if [ "$EVENT" != push ] || [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ] \
-             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+          if [ "$EVENT" = pull_request ] && git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            base='HEAD^1'      # PR merge ref: 첫 부모 = base 브랜치 끝, 둘째 부모 = PR head
+          elif [ "$EVENT" = push ] && [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
+             && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            base="$BEFORE"
+          else
+            base=""
+          fi
+          if [ -z "$base" ]; then
             images="$all"
           else
-            files=$(git diff --name-only "$BEFORE" "$GITHUB_SHA")
+            files=$(git diff --name-only "$base" HEAD)
             printf '바뀐 파일:\n%s\n' "$files"
             has() { grep -qE "$1" <<<"$files"; }
             images=""
@@ -83,6 +93,7 @@ jobs:
 
   test:
     name: ${{ matrix.name }} · test
+    if: github.event_name != 'push'      # main push는 develop → main PR에서 검사한 트리 (GPU-282)
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -125,7 +136,7 @@ jobs:
 
   image:
     name: ${{ matrix.name }} · image
-    needs: [changes, test, plan]
+    needs: [changes, plan]               # 테스트를 기다리지 않는다: PR에서는 병렬, main push에서는 테스트 없음 (GPU-282)
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -162,16 +173,24 @@ jobs:
       # PyTorch CUDA 베이스(압축 3GB대)는 GHA 캐시(저장소 10GB)를 다 차지하므로 trainer는 캐시를 쓰지 않는다
       CACHE_FROM: ${{ matrix.name != 'trainer' && format('type=gha,scope={0}', matrix.name) || '' }}
       CACHE_TO: ${{ matrix.name != 'trainer' && format('type=gha,mode=max,scope={0}', matrix.name) || '' }}
+      # 이번 PR · 머지에서 자기 폴더가 바뀌었나 (changes job). 아니면 빌드 step을 건너뛴다 (GPU-282)
+      BUILD: ${{ contains(format(' {0} ', needs.changes.outputs.images), format(' {0} ', matrix.name)) }}
       PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.release == 'true' && contains(format(' {0} ', needs.changes.outputs.images), format(' {0} ', matrix.name)) }}
     steps:
+      - name: 건너뜀 (이 폴더 변경 없음)
+        if: env.BUILD != 'true'
+        run: echo "### ${{ matrix.name }} — 바뀐 파일이 없어 이미지 빌드를 건너뜀" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v4
+        if: env.BUILD == 'true'
       - name: 디스크 비우기 (PyTorch CUDA 베이스가 커서)
-        if: matrix.name == 'trainer'
+        if: env.BUILD == 'true' && matrix.name == 'trainer'
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
       - uses: docker/setup-buildx-action@v3
+        if: env.BUILD == 'true'
       # 빌드는 한 번만 (GPU-214). main 릴리스면 최종 태그 · 라벨까지 붙여 로컬에 올리고, 점검한 그 이미지를 그대로 push한다
       #   (전에는 push용으로 다시 빌드 — trainer는 캐시가 없어 PyTorch 이미지를 처음부터 두 번 빌드했다)
       - id: meta
+        if: env.BUILD == 'true'
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
@@ -184,6 +203,7 @@ jobs:
             org.opencontainers.image.title=${{ matrix.name }}
             ${{ env.PUSH == 'true' && format('org.opencontainers.image.description={0}', needs.plan.outputs.description) || '' }}
       - name: 이미지 빌드
+        if: env.BUILD == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.name }}
@@ -197,6 +217,7 @@ jobs:
           cache-from: ${{ env.CACHE_FROM }}
           cache-to: ${{ env.CACHE_TO }}
       - name: 이미지 점검
+        if: env.BUILD == 'true'
         run: ${{ matrix.check }}
 
       - name: Log in to GHCR
