@@ -18,6 +18,9 @@
 | `job.submitted` | **재제출본**이 보임 — 복구 재배치(주석 `devoops/recovery-id`) 또는 사용자 다시 시작(주석 `devoops/restart-reason`, payload `restart_reason` · `restart_requested_at`, GPU-234). 첫 제출은 Backend가 보내므로 안 보냄 (`EMIT_FIRST_SUBMITTED=true`면 보냄) | `creationTimestamp` |
 | `job.admitted` | Workload `Admitted=True` (Kueue 입장) | 조건 시각 |
 | `job.placed` | Workload `status.clusterName` (MultiKueue 배치) | admissionCheck Ready 시각 |
+| `job.placement` | Workload 주석 `devoops/placement` (dispatcher 실제 배치, GPU-268). 클러스터 · 노드가 바뀔 때마다 1건 (주석 `observed_at`만 바뀐 갱신은 다시 안 보냄). payload `active_nodes`(정렬) · `placement_generation` · `placement_cluster` · `observed_at`(Unix 초). 주석의 JobSet · 세대가 다르거나 형식이 틀리면 안 보냄. 복구 컨트롤러 작업 등록용 (GPU-275) | 주석 `observed_at` |
+
+모든 사건 payload에 관리 클러스터 JobSet `metadata.uid`를 `jobset_uid`로 싣는다 (MultiKueue 워커 사본 UID 아님, GPU-275).
 | `job.started` / `job.resumed` | Workload `PodsReady=True`, 없으면 JobSet 전부 ready. 재제출본(`devoops/recovery-id` 또는 `devoops/restart-reason`)이면 resumed. 사용자 다시 시작의 resumed는 측정 `v_incidents`에서 장애 복구로 세지 않음 (`db/006`) | 조건 시각, 없으면 본 시각 |
 | `job.completed` | JobSet `Completed=True` | 조건 시각 |
 | `job.failed` | JobSet `Failed=True` | 조건 시각 |

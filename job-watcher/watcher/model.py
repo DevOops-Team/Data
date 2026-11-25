@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +34,9 @@ ANN_STOP_REASON = "devoops/stop-reason"           # "user" = 사용자 중단 �
 ANN_STOP_AT = "devoops/stop-requested-at"
 ANN_RESTART_REASON = "devoops/restart-reason"     # "user" = 사용자 다시 시작 → job.submitted(새 세대) + job.resumed
 ANN_RESTART_AT = "devoops/restart-requested-at"
+# 관리 Workload 주석 — dispatcher가 워커 Pod spec.nodeName으로 남기는 실제 배치 (GPU-268, K8s scheduling/dispatcher/PLACEMENT.md)
+# {"version":1,"jobset":"job-…-g0001","generation":1,"cluster":"eks-a","nodes":["ip-…",…],"observed_at":<unix 초>}
+ANN_PLACEMENT = "devoops/placement"
 GPU_RESOURCE = "nvidia.com/gpu"
 TRAINER = "trainer"
 
@@ -70,6 +74,8 @@ class Snapshot:
     cluster: str | None = None
     placed_at: str | None = None
     pods_ready_at: str | None = None
+    placement: dict[str, Any] | None = None  # 검증한 devoops/placement (cluster · nodes · observed_at · version)
+    jobset_uid: str | None = None            # 관리 클러스터 JobSet metadata.uid (MultiKueue 워커 사본 UID 아님)
     # Kueue가 내림 · 다시 넣음 · 비활성화 (GPU-259). waitForPodsReady 시간 초과(PodsReadyTimeout) · 선점 등
     evicted_at: str | None = None            # 마지막 Evicted=True 조건 시각 (발생마다 바뀜)
     evicted_reason: str | None = None
@@ -187,6 +193,31 @@ def relocation_target(rr: dict[str, Any]) -> str | None:
     return None
 
 
+def placement(workload: dict[str, Any], jobset_name: str, generation: int) -> dict[str, Any] | None:
+    """Workload 주석 devoops/placement를 검증해 돌려준다. 형식이 틀리거나 다른 JobSet · 세대 것이면 None.
+
+    dispatcher는 GPU Pod가 전부 Running이고 서로 다른 노드일 때만 쓰고, 장애가 나면 갱신을 멈춰 장애 직전 배치가 남는다.
+    """
+    raw = ((workload.get("metadata") or {}).get("annotations") or {}).get(ANN_PLACEMENT)
+    if not raw:
+        return None
+    try:
+        v = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(v, dict) or v.get("version") != 1:
+        return None
+    nodes, cluster, observed = v.get("nodes"), v.get("cluster"), v.get("observed_at")
+    if v.get("jobset") != jobset_name or v.get("generation") != generation:
+        return None
+    if not isinstance(cluster, str) or not cluster or not isinstance(observed, int) or isinstance(observed, bool):
+        return None
+    if not isinstance(nodes, list) or not nodes or not all(isinstance(n, str) and n for n in nodes) \
+            or len(set(nodes)) != len(nodes):
+        return None
+    return {"version": 1, "cluster": cluster, "nodes": sorted(nodes), "observed_at": observed}
+
+
 def owner_jobset(workload: dict[str, Any]) -> str | None:
     for o in (workload.get("metadata") or {}).get("ownerReferences") or []:
         if o.get("kind") == "JobSet":
@@ -210,7 +241,7 @@ def snapshot(jobset: dict[str, Any], workload: dict[str, Any] | None = None, *,
         restart_reason=ann.get(ANN_RESTART_REASON), restart_requested_at=ann.get(ANN_RESTART_AT),
         completed_at=condition_time(jobset, "Completed"), failed_at=condition_time(jobset, "Failed"),
         failed_message=_condition_message(jobset, "Failed"),
-        deleted=deleted, deleted_at=meta.get("deletionTimestamp"),
+        deleted=deleted, deleted_at=meta.get("deletionTimestamp"), jobset_uid=meta.get("uid") or None,
     )
     if relocation is not None:
         spec = relocation.get("spec") or {}
@@ -229,4 +260,5 @@ def snapshot(jobset: dict[str, Any], workload: dict[str, Any] | None = None, *,
         count = ((workload.get("status") or {}).get("requeueState") or {}).get("count")
         s.requeue_count = int(count) if isinstance(count, int) else None
         s.deactivated = (workload.get("spec") or {}).get("active") is False
+        s.placement = placement(workload, s.name, s.generation)
     return s
