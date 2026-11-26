@@ -47,6 +47,7 @@ def scenario(conn):
     event(conn, "fault.injected", T("19:00"), job="J", node="n1")
     event(conn, "fault.detected", T("19:30"), job="J", node="n1", payload={"ts": T("19:10")})
     event(conn, "job.resumed", T("23:00"), job="J", gen=2)
+    event(conn, "job.progress", T("23:00"), job="J", gen=2, payload={"status": "RUNNING", "step": 401, "step_seconds": 1.2})  # 새 세대 첫 step (GPU-283)
     return conn
 
 
@@ -117,6 +118,7 @@ def _scenario_without_injection_event(conn):
         event(conn, "job.progress", T(at), job="J", gen=1, payload={"step": step, "step_seconds": 1.2})
     event(conn, "fault.detected", T("19:30"), job="J", node="n1", payload={"ts": T("19:10"), "dedup_key": "d1"})
     event(conn, "job.resumed", T("23:00"), job="J", gen=2)
+    event(conn, "job.progress", T("23:00"), job="J", gen=2, payload={"status": "RUNNING", "step": 401, "step_seconds": 1.2})  # 새 세대 첫 step (GPU-283)
 
 
 def test_manual_injection_record_gives_same_numbers(conn):

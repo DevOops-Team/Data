@@ -48,7 +48,7 @@ Kafka 토픽의 사건을 읽어 PostgreSQL `gpuf_data`의 `data` 스키마(`db/
 | `postgres_exporter` | `pg_monitor` (통계 읽기만), 데이터 테이블 접근 없음, 연결 3개까지 | 모니터링 (ADR-18) |
 | `backend_ro` (`db/004_backend_role.sql`) | `v_job_status` · `job_runs` · `job_progress` · `checkpoints` 읽기만. `events` 등 사건 원본 · 쓰기 없음. `statement_timeout` 5s, 연결 10개까지 | Backend 화면 (GPU-141) |
 
-적용 순서: `001_init.sql`(data_app) → `002_roles.sql`(postgres) → `003_job_progress.sql`(data_app) → `004_backend_role.sql`(postgres) → `\password backend_ro` → `005_progress_error.sql`(data_app) → `006_incidents_skip_restart.sql`(data_app, 사용자 다시 시작의 `job.resumed`를 `v_incidents` 복구 시각에서 뺌, GPU-234) → `007_incident_start.sql`(data_app, 수동 주입 기록 표 `data.injections` + 장애 시작 출처, GPU-239) → `008_recovery_held_view.sql`(data_app, HOLD 목록 뷰, GPU-252) → `009_incident_window.sql`(data_app, 감지 · 분류 사건을 장애 시작 뒤 15분 안으로, GPU-269). 005 뒤에는 003을 다시 돌리지 않는다 (뷰 칸 수가 달라 교체 거부).
+적용 순서: `001_init.sql`(data_app) → `002_roles.sql`(postgres) → `003_job_progress.sql`(data_app) → `004_backend_role.sql`(postgres) → `\password backend_ro` → `005_progress_error.sql`(data_app) → `006_incidents_skip_restart.sql`(data_app, 사용자 다시 시작의 `job.resumed`를 `v_incidents` 복구 시각에서 뺌, GPU-234) → `007_incident_start.sql`(data_app, 수동 주입 기록 표 `data.injections` + 장애 시작 출처, GPU-239) → `008_recovery_held_view.sql`(data_app, HOLD 목록 뷰, GPU-252) → `009_incident_window.sql`(data_app, 감지 · 분류 사건을 장애 시작 뒤 15분 안으로, GPU-269) → `010_incident_resume.sql`(data_app, 복구 끝 = 새 세대가 승인본 다음 step을 실제로 진행한 첫 시각, `job.resumed`는 `pods_ready_at` 중간 단계로, GPU-283). 005 뒤에는 003을 다시 돌리지 않는다 (뷰 칸 수가 달라 교체 거부).
 
 ### 장애 시작 시각 (측정, GPU-239)
 
