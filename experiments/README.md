@@ -94,6 +94,7 @@ Backend는 Young–Daly 공식으로 간격을 정한다: √(2 × 저장 시간
 1. **운영 기본값은 공식 그대로 좋다.** 저장 비용과 잃는 양을 같이 따진 표준 방식이다.
 2. **실험 · 시연에서는 간격을 실험 조건으로 고정할 수 있어야 한다.** MTBF 6시간 가정과 달리 실험은 몇 분 안에 장애를 넣으므로, 845초면 첫 저장 전에 장애가 나거나 최대 14분 학습을 잃어 정책 차이가 저장 시점 운에 묻힌다. 제출 때 `checkpoint_policy.interval_seconds`(또는 step 간격)를 덮어쓸 수 있게 해 주면, 투입기가 실험 E 조건(120초 · 공식값)을 넣고 `experiment.started`의 `checkpoint_every_steps`에 기록한다.
 3. **첫 측정 20 step(`warmup_measure_steps`) 동안은 저장하지 않으므로** 장애 주입은 첫 승인 뒤에 한다 (위 실험 절차).
+   - **GPU-298 반영**: 지금은 Backend 설정 `checkpoint.every_steps`(기본 100)로 100 step마다 고정 저장한다(config schema 4 `checkpoint_policy.every_steps`). 고정 간격일 때는 측정 구간이 없어 첫 저장은 step 100이다. Young/Daly로 돌아가려면 `every_steps: 0`.
 4. **저장량**: 1회 저장 약 1.65GB(2 rank), job `4734d7ac`는 3회로 약 4.9GB. 120초 간격으로 20분 돌리면 10회 ≈ 16GB → ADR-30(학습 끝나면 최종 체크포인트만 남김) 정리가 꼭 필요하다.
 
 ## 확인 필요
