@@ -178,7 +178,11 @@ def wrap(net, device, method: str):
     names = set(getattr(net.lm, "_no_split_modules", None) or [])
     blocks = {type(m) for m in net.modules() if type(m).__name__ in names}
     # T4는 bf16이 없다 → fp16 계산 · 통신. 버퍼(RoPE inv_freq)는 fp32 그대로 둔다
-    mp = MixedPrecision(param_dtype=torch.float16, reduce_dtype=torch.float16, buffer_dtype=torch.float32)
+    # cast_forward_inputs(QLoRA만): 조각마다 입력을 fp16으로 맞춘다. peft 4bit LoRA는 입력을 lora_A.weight.dtype
+    # (FSDP가 든 fp32 원본)으로 바꾸는데 lora_A 조각은 fp16으로 모아 계산해 float != Half로 죽었다 (GPU-301).
+    # 어댑터 원본 fp32 · 기울기 fp32 반영은 그대로다. Full은 원래대로 둔다
+    mp = MixedPrecision(param_dtype=torch.float16, reduce_dtype=torch.float16, buffer_dtype=torch.float32,
+                        cast_forward_inputs=method == "qlora")
     common = dict(device_id=device, mixed_precision=mp, sharding_strategy=ShardingStrategy[SHARDING[method]],
                   limit_all_gathers=True, forward_prefetch=True)
     if method == "full":
