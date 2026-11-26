@@ -61,7 +61,7 @@ import time
 from dataclasses import dataclass, fields
 
 SCHEMA_VERSION = 3          # Backend가 쓰는 최신. 3: finetune(학습 방식 full · qlora) 추가 (GPU-262)
-SCHEMA_VERSIONS = (2, 3)    # 2는 finetune 칸이 없다 = full (배포 순서: 하네스 먼저, Backend 나중)
+SCHEMA_VERSIONS = (2, 3, 4)  # 2는 finetune 칸이 없다 = full · 4는 checkpoint_policy.every_steps (GPU-298). 배포 순서: 하네스 먼저, Backend 나중
 FINETUNE_METHODS = ("full", "qlora")
 
 
@@ -92,6 +92,9 @@ class CheckpointPolicy:
     estimated_save_seconds: float
     mtbf_seconds: float
     warmup_measure_steps: int
+    # 고정 저장 간격(step, GPU-298). 0보다 크면 이 간격으로 저장하고 Young/Daly 측정 · 변환은 하지 않는다.
+    # 0(schema 2 · 3은 칸 없음 = 0)이면 원래대로 interval_seconds를 측정한 step 시간으로 바꾼다.
+    every_steps: int = 0
 
 
 @dataclass(frozen=True)
@@ -167,7 +170,13 @@ def parse_config(raw: bytes, expected_sha: str | None) -> tuple[TrainConfig, str
     if set(data) != names:  # 오타 · 누락을 조용히 넘기지 않는다
         raise SystemExit(f"config keys: missing {names - set(data)}, unknown {set(data) - names}")
     data["dataset"] = DatasetRef(**data["dataset"])
-    data["checkpoint_policy"] = CheckpointPolicy(**data["checkpoint_policy"])
+    policy = data["checkpoint_policy"]
+    if not isinstance(policy, dict) or (version == 4) != ("every_steps" in policy):  # schema 4에만, 반드시 있다
+        raise SystemExit(f"config schema_version {version}: checkpoint_policy.every_steps must be "
+                         f"{'present' if version == 4 else 'absent'}")
+    data["checkpoint_policy"] = CheckpointPolicy(**policy)
+    if data["checkpoint_policy"].every_steps < 0:
+        raise SystemExit(f"checkpoint_policy.every_steps must be >= 0, got {data['checkpoint_policy'].every_steps}")
     data["finetune"] = parse_finetune(data["finetune"])
     cfg = TrainConfig(**data)
     want = CHECKPOINT_FORMATS.get(cfg.training_mode)
@@ -541,13 +550,19 @@ class Session:
         self.profile_every = profile_every if profile_every is not None else int(env.get("PROFILE_EVERY", PROFILE_EVERY))
         self.start = 0
         self.last_saved = 0
-        self.every: int | None = None                           # 저장 간격(step). 측정이 끝나기 전에는 None
+        fixed = policy.every_steps if policy else 0
+        # 저장 간격(step). 고정 간격(GPU-298)이면 처음부터, 아니면 측정이 끝나기 전에는 None
+        self.every: int | None = fixed if fixed > 0 else None
         self._measure_start: float | None = None
         self._measure_until = 0
         self._mark: float | None = None
         self._prof = None
         self.metrics.stage("init")
         self.progress.write(status="RUNNING", step=0, total_steps=total_steps, last_checkpoint_step=0)
+        if self.every is not None:
+            self.progress.write(checkpoint_every_steps=self.every)
+            if self.rank == 0:
+                print(f"fixed checkpoint interval: save every {self.every} steps", flush=True)
 
     # ---------- with ----------
     def __enter__(self) -> "Session":
@@ -634,7 +649,7 @@ class Session:
         self._mark = time.perf_counter()
 
     def should_save(self, step: int) -> bool:
-        """이번 step에 저장할지. 마지막 step은 항상, 그 밖에는 측정한 간격마다 (측정 전에는 안 함)."""
+        """이번 step에 저장할지. 마지막 step은 항상, 그 밖에는 고정 간격 또는 측정한 간격마다 (측정 전에는 안 함)."""
         return step == self.total or (self.every is not None and step % self.every == 0)
 
     def save(self, model, optimizer, step: int) -> float:

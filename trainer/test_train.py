@@ -98,6 +98,30 @@ class Finetune(unittest.TestCase):
             ckpt.parse_config(raw({**CONFIG, "finetune": {"method": "full", "lora": None}}), None)
 
 
+class FixedEvery(unittest.TestCase):
+    """schema 4: checkpoint_policy.every_steps 고정 저장 간격 (GPU-298)."""
+
+    def v4(self, **policy):
+        return {**CONFIG, "schema_version": 4, "finetune": {"method": "full", "lora": None},
+                "checkpoint_policy": {**CONFIG["checkpoint_policy"], **policy}}
+
+    def test_reads_every_steps(self):
+        cfg, _ = ckpt.parse_config(raw(self.v4(every_steps=100)), None)
+        self.assertEqual(cfg.checkpoint_policy.every_steps, 100)
+
+    def test_old_schema_means_young_daly(self):
+        cfg, _ = ckpt.parse_config(raw(), None)
+        self.assertEqual(cfg.checkpoint_policy.every_steps, 0)
+
+    def test_every_steps_only_in_schema_4(self):
+        bad = ({**CONFIG, "checkpoint_policy": {**CONFIG["checkpoint_policy"], "every_steps": 100}},
+               {**self.v4(), "checkpoint_policy": CONFIG["checkpoint_policy"]},
+               self.v4(every_steps=-1))
+        for cfg in bad:
+            with self.subTest(cfg=cfg["checkpoint_policy"]), self.assertRaises(SystemExit):
+                ckpt.parse_config(raw(cfg), None)
+
+
 class CheckpointEvery(unittest.TestCase):
     def test_long_runs_save_more_often_than_short_runs(self):
         # 10000 step × 0.5 s = 5000 s, τ 844 s → 5번, 2000 step마다

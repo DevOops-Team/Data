@@ -73,7 +73,7 @@ gradient accumulation · 옵티마이저 여러 개처럼 `fit()`이 못 하는 
 
 ## 동작
 
-- 체크포인트 간격: config.json `checkpoint_policy.interval_seconds`(Young/Daly)를 처음 `warmup_measure_steps` step의 시간으로 step 간격으로 바꾼다 (설계 문서 5절, `report()` 안)
+- 체크포인트 간격: config schema 4의 `checkpoint_policy.every_steps`가 0보다 크면 그 step마다 저장한다(GPU-298, 지금 Backend 기본 100). 0이면 원래대로 `interval_seconds`(Young/Daly)를 처음 `warmup_measure_steps` step의 시간으로 step 간격으로 바꾼다 (설계 문서 5절, `report()` 안)
 - 재개: ckpt-init이 승인본을 `/ckpt/step-N/`에 받고 `/ckpt/resume.json`을 남기면 그 step의 모델 · 옵티마이저(Adam 모멘트)를 불러와
   step N 다음부터 같은 데이터 순서로 이어 간다 (GPU-119). 옵티마이저는 `state`만 저장하고 `param_groups`(lr · betas 등)는 코드 · 스케줄이 정한다
 - 학습 지표 (GPU-96): 모든 rank가 `:8000/metrics`(env `METRICS_PORT`, 0이면 끔)로 8개를 연다 — 이름 · 라벨 · 버킷은 Monitoring 레포 `docs/training-metrics.md`.
